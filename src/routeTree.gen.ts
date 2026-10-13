@@ -9,61 +9,226 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
+import { Route as ArgusRouteImport } from './routes/_argus'
+import { Route as ArgusIndexRouteImport } from './routes/_argus.index'
+import { Route as ArgusThreatMapRouteImport } from './routes/_argus.threat-map'
+import { Route as ArgusSubmissionsRouteImport } from './routes/_argus.submissions'
+import { Route as ArgusSettingsRouteImport } from './routes/_argus.settings'
+import { Route as ArgusReportsRouteImport } from './routes/_argus.reports'
+import { Route as ArgusKnowledgeGraphRouteImport } from './routes/_argus.knowledge-graph'
+import { Route as ArgusAnalysisRouteImport } from './routes/_argus.analysis'
+import { Route as ArgusAgentsRouteImport } from './routes/_argus.agents'
 
-const IndexRoute = IndexRouteImport.update({
+const ArgusRoute = ArgusRouteImport.update({
+  id: '/_argus',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ArgusIndexRoute = ArgusIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRouteImport,
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusThreatMapRoute = ArgusThreatMapRouteImport.update({
+  id: '/threat-map',
+  path: '/threat-map',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusSubmissionsRoute = ArgusSubmissionsRouteImport.update({
+  id: '/submissions',
+  path: '/submissions',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusSettingsRoute = ArgusSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusReportsRoute = ArgusReportsRouteImport.update({
+  id: '/reports',
+  path: '/reports',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusKnowledgeGraphRoute = ArgusKnowledgeGraphRouteImport.update({
+  id: '/knowledge-graph',
+  path: '/knowledge-graph',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusAnalysisRoute = ArgusAnalysisRouteImport.update({
+  id: '/analysis',
+  path: '/analysis',
+  getParentRoute: () => ArgusRoute,
+} as any)
+const ArgusAgentsRoute = ArgusAgentsRouteImport.update({
+  id: '/agents',
+  path: '/agents',
+  getParentRoute: () => ArgusRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof IndexRoute
+  '/': typeof ArgusIndexRoute
+  '/agents': typeof ArgusAgentsRoute
+  '/analysis': typeof ArgusAnalysisRoute
+  '/knowledge-graph': typeof ArgusKnowledgeGraphRoute
+  '/reports': typeof ArgusReportsRoute
+  '/settings': typeof ArgusSettingsRoute
+  '/submissions': typeof ArgusSubmissionsRoute
+  '/threat-map': typeof ArgusThreatMapRoute
 }
 export interface FileRoutesByTo {
-  '/': typeof IndexRoute
+  '/agents': typeof ArgusAgentsRoute
+  '/analysis': typeof ArgusAnalysisRoute
+  '/knowledge-graph': typeof ArgusKnowledgeGraphRoute
+  '/reports': typeof ArgusReportsRoute
+  '/settings': typeof ArgusSettingsRoute
+  '/submissions': typeof ArgusSubmissionsRoute
+  '/threat-map': typeof ArgusThreatMapRoute
+  '/': typeof ArgusIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/': typeof IndexRoute
+  '/_argus': typeof ArgusRouteWithChildren
+  '/_argus/agents': typeof ArgusAgentsRoute
+  '/_argus/analysis': typeof ArgusAnalysisRoute
+  '/_argus/knowledge-graph': typeof ArgusKnowledgeGraphRoute
+  '/_argus/reports': typeof ArgusReportsRoute
+  '/_argus/settings': typeof ArgusSettingsRoute
+  '/_argus/submissions': typeof ArgusSubmissionsRoute
+  '/_argus/threat-map': typeof ArgusThreatMapRoute
+  '/_argus/': typeof ArgusIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/agents'
+    | '/analysis'
+    | '/knowledge-graph'
+    | '/reports'
+    | '/settings'
+    | '/submissions'
+    | '/threat-map'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/agents'
+    | '/analysis'
+    | '/knowledge-graph'
+    | '/reports'
+    | '/settings'
+    | '/submissions'
+    | '/threat-map'
+    | '/'
+  id:
+    | '__root__'
+    | '/_argus'
+    | '/_argus/agents'
+    | '/_argus/analysis'
+    | '/_argus/knowledge-graph'
+    | '/_argus/reports'
+    | '/_argus/settings'
+    | '/_argus/submissions'
+    | '/_argus/threat-map'
+    | '/_argus/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute
+  ArgusRoute: typeof ArgusRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
+    '/_argus': {
+      id: '/_argus'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof ArgusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_argus/': {
+      id: '/_argus/'
       path: '/'
       fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
+      preLoaderRoute: typeof ArgusIndexRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/threat-map': {
+      id: '/_argus/threat-map'
+      path: '/threat-map'
+      fullPath: '/threat-map'
+      preLoaderRoute: typeof ArgusThreatMapRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/submissions': {
+      id: '/_argus/submissions'
+      path: '/submissions'
+      fullPath: '/submissions'
+      preLoaderRoute: typeof ArgusSubmissionsRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/settings': {
+      id: '/_argus/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof ArgusSettingsRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/reports': {
+      id: '/_argus/reports'
+      path: '/reports'
+      fullPath: '/reports'
+      preLoaderRoute: typeof ArgusReportsRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/knowledge-graph': {
+      id: '/_argus/knowledge-graph'
+      path: '/knowledge-graph'
+      fullPath: '/knowledge-graph'
+      preLoaderRoute: typeof ArgusKnowledgeGraphRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/analysis': {
+      id: '/_argus/analysis'
+      path: '/analysis'
+      fullPath: '/analysis'
+      preLoaderRoute: typeof ArgusAnalysisRouteImport
+      parentRoute: typeof ArgusRoute
+    }
+    '/_argus/agents': {
+      id: '/_argus/agents'
+      path: '/agents'
+      fullPath: '/agents'
+      preLoaderRoute: typeof ArgusAgentsRouteImport
+      parentRoute: typeof ArgusRoute
     }
   }
 }
 
+interface ArgusRouteChildren {
+  ArgusAgentsRoute: typeof ArgusAgentsRoute
+  ArgusAnalysisRoute: typeof ArgusAnalysisRoute
+  ArgusKnowledgeGraphRoute: typeof ArgusKnowledgeGraphRoute
+  ArgusReportsRoute: typeof ArgusReportsRoute
+  ArgusSettingsRoute: typeof ArgusSettingsRoute
+  ArgusSubmissionsRoute: typeof ArgusSubmissionsRoute
+  ArgusThreatMapRoute: typeof ArgusThreatMapRoute
+  ArgusIndexRoute: typeof ArgusIndexRoute
+}
+
+const ArgusRouteChildren: ArgusRouteChildren = {
+  ArgusAgentsRoute: ArgusAgentsRoute,
+  ArgusAnalysisRoute: ArgusAnalysisRoute,
+  ArgusKnowledgeGraphRoute: ArgusKnowledgeGraphRoute,
+  ArgusReportsRoute: ArgusReportsRoute,
+  ArgusSettingsRoute: ArgusSettingsRoute,
+  ArgusSubmissionsRoute: ArgusSubmissionsRoute,
+  ArgusThreatMapRoute: ArgusThreatMapRoute,
+  ArgusIndexRoute: ArgusIndexRoute,
+}
+
+const ArgusRouteWithChildren = ArgusRoute._addFileChildren(ArgusRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
-  IndexRoute: IndexRoute,
+  ArgusRoute: ArgusRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}
