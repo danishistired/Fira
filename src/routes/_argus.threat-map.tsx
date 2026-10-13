@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import * as d3 from "d3";
-import { feature } from "topojson-client";
+
 import { c2Nodes } from "@/components/argus/mockData";
 
 export const Route = createFileRoute("/_argus/threat-map")({
