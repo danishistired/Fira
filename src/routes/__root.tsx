@@ -55,7 +55,7 @@ function RootShell({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className="dark">
       <head><HeadContent /></head>
-      <body className="dark scanlines">{children}<Scripts /></body>
+      <body className="dark">{children}<Scripts /></body>
     </html>
   );
 }

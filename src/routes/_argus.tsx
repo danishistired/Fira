@@ -8,7 +8,7 @@ export const Route = createFileRoute("/_argus")({
 function ArgusLayout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   return (
-    <div className="min-h-screen overflow-hidden bg-background text-foreground scanlines">
+    <div className="min-h-screen bg-background text-foreground antialiased">
       {pathname === "/" ? <HomePage /> : <Outlet />}
     </div>
   );
