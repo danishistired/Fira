@@ -35,6 +35,7 @@ dist-ssr
 analysis/.venv/
 analysis/__pycache__/
 analysis/out*/
+analysis/.env
 analysis/flask.log
 analysis/test_flask.log
 

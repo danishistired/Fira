@@ -35,6 +35,7 @@ type TimelineEntry = {
   ts: number;
 };
 type ChatMsg = { role: "user" | "assistant"; text: string; id: string };
+type AgentFinding = { summary: string; detail: string };
 type Report = {
   fileName: string;
   permissionScore: number;
@@ -43,9 +44,15 @@ type Report = {
   pipelineStatus: {
     apktool: { success: boolean; message: string };
     jadx: { success: boolean; message: string };
+    sandbox: { success: boolean; message: string };
   };
   verdict: "benign" | "suspicious" | "malicious";
   confidence: number;
+  executiveSummary?: string;
+  recommendedActions?: string;
+  mitreTechniques?: string[];
+  agentFindings?: Record<string, AgentFinding>;
+  package?: string;
 } | null;
 
 type Conversation = {
@@ -223,12 +230,17 @@ export function Home() {
       const apiCalls = result.api_calls ?? [];
       const pipelineStatus = result.pipeline_status ?? {
         apktool: { success: false, message: "Not run" },
-        jadx: { success: false, message: "Not run" }
+        jadx: { success: false, message: "Not run" },
+        sandbox: { success: false, message: "Not run" }
       };
+      // Use LLM verdict if available, otherwise fallback to rule-based
       const verdict: "benign" | "suspicious" | "malicious" =
-        score > 70 ? "malicious" : score > 40 ? "suspicious" : "benign";
+        result.verdict ?? (score > 70 ? "malicious" : score > 40 ? "suspicious" : "benign");
+      const confidence: number = result.confidence ?? Math.min(99, 60 + Math.round(score / 3));
+      const agentFindings: Record<string, AgentFinding> | undefined = result.agent_findings;
 
-      const summaries: Record<string, string> = {
+      // Use LLM agent summaries if available, otherwise fallback
+      const fallbackSummaries: Record<string, string> = {
         perm: `${highRisk.length} high-risk permissions`,
         code: "Static scan complete",
         behavior: "No anomalous runtime patterns",
@@ -236,9 +248,10 @@ export function Home() {
         threat: "Correlated against intel feeds",
         consensus: `Verdict: ${verdict}`,
       };
-      AGENT_TEMPLATE.forEach((a, i) =>
-        setAgent(a.id, "done", summaries[a.id], 4 + i * 3),
-      );
+      AGENT_TEMPLATE.forEach((a, i) => {
+        const finding = agentFindings?.[a.id];
+        setAgent(a.id, "done", finding?.summary ?? fallbackSummaries[a.id], 4 + i * 3);
+      });
 
       setConversations((list) =>
         list.map((c) =>
@@ -254,14 +267,21 @@ export function Home() {
                   apiCalls,
                   pipelineStatus,
                   verdict,
-                  confidence: Math.min(99, 60 + Math.round(score / 3)),
+                  confidence,
+                  executiveSummary: result.executive_summary,
+                  recommendedActions: result.recommended_actions,
+                  mitreTechniques: result.mitre_techniques,
+                  agentFindings,
+                  package: result.package,
                 },
                 messages: [
                   ...c.messages,
                   {
                     id: newId(),
                     role: "assistant",
-                    text: `Analysis complete. Verdict: ${verdict}. ${highRisk.length} high-risk permissions detected. See report below — ask follow-ups anytime.`,
+                    text: result.executive_summary
+                      ? `Analysis complete. ${result.executive_summary}`
+                      : `Analysis complete. Verdict: ${verdict}. ${highRisk.length} high-risk permissions detected. See report below — ask follow-ups anytime.`,
                   },
                 ],
               }
@@ -295,27 +315,70 @@ export function Home() {
     }
   };
 
-  const submitChat = () => {
+  const submitChat = async () => {
     const text = input.trim();
     if (!text) return;
     setInput("");
+
+    // Add user message immediately
+    const thinkingId = newId();
     updateActive((c) => ({
       ...c,
       messages: [
         ...c.messages,
         { id: newId(), role: "user", text },
-        {
-          id: newId(),
-          role: "assistant",
-          text:
-            c.status === "complete"
-              ? answerFromReport(text, c.report)
-              : c.status === "analyzing"
-                ? "Analysis is still running. I'll have a complete answer once the agents converge."
-                : "Upload an APK with the + button and I'll begin a multi-agent analysis.",
-        },
+        { id: thinkingId, role: "assistant", text: "Thinking…" },
       ],
     }));
+
+    if (active?.status !== "complete" || !active?.report) {
+      // No report — give a static answer
+      setConversations((list) =>
+        list.map((c) =>
+          c.id === activeId
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === thinkingId
+                    ? { ...m, text: active?.status === "analyzing"
+                        ? "Analysis is still running. I'll have a complete answer once the agents converge."
+                        : "Upload an APK with the + button and I'll begin a multi-agent analysis." }
+                    : m,
+                ),
+              }
+            : c,
+        ),
+      );
+      return;
+    }
+
+    try {
+      const resp = await fetch("http://localhost:5050/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: text,
+          report_context: active.report,
+        }),
+      });
+      const data = await resp.json();
+      const answer = data.answer ?? "Sorry, I couldn't generate a response.";
+      setConversations((list) =>
+        list.map((c) =>
+          c.id === activeId
+            ? { ...c, messages: c.messages.map((m) => (m.id === thinkingId ? { ...m, text: answer } : m)) }
+            : c,
+        ),
+      );
+    } catch {
+      setConversations((list) =>
+        list.map((c) =>
+          c.id === activeId
+            ? { ...c, messages: c.messages.map((m) => (m.id === thinkingId ? { ...m, text: "Sorry, I couldn't reach the analysis server." } : m)) }
+            : c,
+        ),
+      );
+    }
   };
 
   const newConversation = () => {
@@ -673,10 +736,16 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
       </header>
 
       <Section title="Executive Summary">
-        ARGUS performed a multi-agent static and behavioural review of <span className="text-neutral-100">{report.fileName}</span>.
-        Permission posture scored <span className="text-neutral-100">{report.permissionScore}%</span>, with{" "}
-        <span className="text-neutral-100">{report.highRisk.length}</span> high-risk capabilities surfaced. Consensus across the
-        six agents converged on a <span className={verdictColor}>{report.verdict}</span> verdict.
+        {report.executiveSummary ? (
+          <span>{report.executiveSummary}</span>
+        ) : (
+          <>
+            ARGUS performed a multi-agent static and behavioural review of <span className="text-neutral-100">{report.fileName}</span>.
+            Permission posture scored <span className="text-neutral-100">{report.permissionScore}%</span>, with{" "}
+            <span className="text-neutral-100">{report.highRisk.length}</span> high-risk capabilities surfaced. Consensus across the
+            six agents converged on a <span className={verdictColor}>{report.verdict}</span> verdict.
+          </>
+        )}
       </Section>
 
       <div className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-white/[0.06] bg-white/[0.04]">
@@ -720,7 +789,7 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
         )}
       </Section>
 
-      <Section title="Pipeline Status (Phase 1)">
+      <Section title="Pipeline Status">
         <ul className="space-y-1 font-mono text-[12px]">
           <li>
             <span className={report.pipelineStatus?.apktool?.success ? "text-emerald-400" : "text-amber-500"}>
@@ -734,15 +803,36 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
             </span>{" "}
             {report.pipelineStatus?.jadx?.message}
           </li>
+          <li>
+            <span className={report.pipelineStatus?.sandbox?.success ? "text-emerald-400" : "text-amber-500"}>
+              [Sandbox]
+            </span>{" "}
+            {report.pipelineStatus?.sandbox?.message}
+          </li>
         </ul>
       </Section>
 
+      {report.mitreTechniques && report.mitreTechniques.length > 0 && (
+        <Section title="MITRE ATT&CK Techniques">
+          <ul className="space-y-1">
+            {report.mitreTechniques.map((t, i) => (
+              <li key={i} className="flex items-start gap-2">
+                <ChevronRight size={12} className="mt-1.5 text-neutral-600" />
+                <span className="font-mono text-[12px] text-neutral-200">{t}</span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
       <Section title="Recommended Actions">
-        {report.verdict === "malicious"
-          ? "Quarantine the sample, revoke any associated certificates, and pivot on observed network indicators."
-          : report.verdict === "suspicious"
-            ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
-            : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
+        {report.recommendedActions
+          ? report.recommendedActions
+          : report.verdict === "malicious"
+            ? "Quarantine the sample, revoke any associated certificates, and pivot on observed network indicators."
+            : report.verdict === "suspicious"
+              ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
+              : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
       </Section>
     </motion.article>
   );
@@ -773,17 +863,4 @@ function Stat({ label, value, valueClass = "text-neutral-100" }: { label: string
   );
 }
 
-// ---------- helpers ----------
-function answerFromReport(question: string, report: Report): string {
-  if (!report) return "No report is loaded yet.";
-  const q = question.toLowerCase();
-  if (q.includes("permission") || q.includes("flagged"))
-    return `The Permission Agent flagged ${report.highRisk.length} high-risk capabilities: ${report.highRisk.join(", ") || "none"}. Permission posture scored ${report.permissionScore}%.`;
-  if (q.includes("network") || q.includes("traffic"))
-    return "The Network Agent captured the outbound traffic profile. No connections matched known C2 indicators in the current feed.";
-  if (q.includes("mitre") || q.includes("attack") || q.includes("technique"))
-    return "Mapped techniques: T1430 (Location Tracking), T1437 (Application Layer Protocol), T1417 (Input Capture).";
-  if (q.includes("why"))
-    return `Verdict ${report.verdict} was reached because permission posture scored ${report.permissionScore}% with ${report.highRisk.length} high-risk capabilities and consensus across all agents.`;
-  return `Verdict: ${report.verdict} at ${report.confidence}% confidence. Ask about permissions, network, MITRE mapping, or behaviour for specifics.`;
-}
+// answerFromReport removed — chat is now powered by the /chat API endpoint

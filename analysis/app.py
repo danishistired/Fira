@@ -3,8 +3,17 @@ import tempfile
 import subprocess
 import shutil
 import logging
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Import the new sandbox module
+from sandbox import SandboxOrchestrator
+
+# Load .env from the same directory as this script
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # Suppress androguard's extremely verbose DEBUG output
 logging.getLogger('androguard').setLevel(logging.WARNING)
@@ -19,12 +28,20 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# Ensure Java is in PATH for apktool and jadx (winget default path)
+# ---------- DeepSeek LLM Client ----------
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
+if DEEPSEEK_API_KEY:
+    llm_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    print("[INIT] DeepSeek client initialized", flush=True)
+else:
+    llm_client = None
+    print("[INIT] WARNING: No DEEPSEEK_API_KEY found, LLM features disabled", flush=True)
+
+# ---------- Java / Tool Paths ----------
 java_path = r"C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot\bin"
 if os.path.exists(java_path) and java_path not in os.environ["PATH"]:
     os.environ["PATH"] = java_path + os.pathsep + os.environ["PATH"]
 
-# Simple high-risk permission set for scoring
 HIGH_RISK_PERMISSIONS = {
     "android.permission.SEND_SMS",
     "android.permission.RECEIVE_SMS",
@@ -51,7 +68,6 @@ SUSPICIOUS_API_PATTERNS = {
     "HttpURLConnection": "Network Connection",
 }
 
-# Compute project root once at module level using pathlib (reliable even when __file__ is relative)
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,14 +80,12 @@ print(f"[INIT] PROJECT_ROOT = {PROJECT_ROOT}", flush=True)
 for tool_name, tool_p in TOOL_PATHS.items():
     print(f"[INIT] {tool_name} -> {tool_p} (exists={tool_p.exists()})", flush=True)
 
+# ---------- Tool helpers ----------
 def get_tool_path(name):
     local_path = TOOL_PATHS.get(name)
     if local_path and local_path.exists():
-        print(f"[get_tool_path] {name} found at {local_path}", flush=True)
         return str(local_path)
-    which_path = shutil.which(name)
-    print(f"[get_tool_path] {name} not in project, shutil.which -> {which_path}", flush=True)
-    return which_path
+    return shutil.which(name)
 
 def run_apktool(apk_path, out_dir):
     tool_path = get_tool_path('apktool')
@@ -84,10 +98,6 @@ def run_apktool(apk_path, out_dir):
         stdout = result.stdout.decode(errors='replace')
         stderr = result.stderr.decode(errors='replace')
         print(f"[run_apktool] returncode={result.returncode}", flush=True)
-        if stdout.strip():
-            print(f"[run_apktool] STDOUT:\n{stdout}", flush=True)
-        if stderr.strip():
-            print(f"[run_apktool] STDERR:\n{stderr}", flush=True)
         if result.returncode != 0:
             return False, f"APKtool error (rc={result.returncode}): {stderr or stdout}"
         return True, "APKtool extraction successful"
@@ -106,10 +116,6 @@ def run_jadx(apk_path, out_dir):
         stdout = result.stdout.decode(errors='replace')
         stderr = result.stderr.decode(errors='replace')
         print(f"[run_jadx] returncode={result.returncode}", flush=True)
-        if stdout.strip():
-            print(f"[run_jadx] STDOUT:\n{stdout}", flush=True)
-        if stderr.strip():
-            print(f"[run_jadx] STDERR:\n{stderr}", flush=True)
         if result.returncode != 0:
             return False, f"JADX error (rc={result.returncode}): {stderr or stdout}"
         return True, "JADX decompilation successful"
@@ -121,7 +127,6 @@ def extract_api_calls_from_source(source_dir):
     found_apis = []
     if not os.path.exists(source_dir):
         return found_apis
-
     for root, _, files in os.walk(source_dir):
         for f in files:
             if f.endswith('.java'):
@@ -138,10 +143,208 @@ def extract_api_calls_from_source(source_dir):
                     pass
     return found_apis
 
+def collect_code_snippets(source_dir, api_calls, max_snippets=10, context_lines=5):
+    """Collect short code snippets around suspicious API calls for LLM context."""
+    snippets = []
+    if not os.path.exists(source_dir) or not api_calls:
+        return snippets
+    # Build a set of (api_pattern, filename) pairs to find
+    targets = {(a['api'], a['file']) for a in api_calls[:max_snippets]}
+    for root, _, files in os.walk(source_dir):
+        for fname in files:
+            if not fname.endswith('.java'):
+                continue
+            matching = [(api, fn) for api, fn in targets if fn == fname]
+            if not matching:
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
+                    lines = fp.readlines()
+                for api_pattern, _ in matching:
+                    for i, line in enumerate(lines):
+                        if api_pattern in line:
+                            start = max(0, i - context_lines)
+                            end = min(len(lines), i + context_lines + 1)
+                            snippet = ''.join(lines[start:end])
+                            snippets.append({
+                                "file": fname,
+                                "api": api_pattern,
+                                "line": i + 1,
+                                "code": snippet[:800]  # cap length
+                            })
+                            break  # one snippet per api per file
+            except Exception:
+                pass
+    return snippets[:max_snippets]
+
+# ---------- LLM Analysis Functions ----------
+
+def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snippets, manifest_snippet="", dynamic_logs=None):
+    """Run a batched 6-agent analysis via DeepSeek. Returns per-agent findings."""
+    if not llm_client:
+        return None
+
+    # Build the data context for the LLM
+    data_context = f"""## APK Analysis Data
+
+**Package**: {package_name}
+
+**All Permissions** ({len(permissions)}):
+{chr(10).join(f'- {p}' for p in permissions)}
+
+**High-Risk Permissions** ({len(high_risk)}):
+{chr(10).join(f'- {p}' for p in high_risk)}
+
+**Suspicious API Calls** ({len(api_calls)}):
+{chr(10).join(f'- {a["api"]} ({a["description"]}) in {a["file"]}' for a in api_calls)}
+"""
+
+    if code_snippets:
+        data_context += "\n**Code Snippets Around Suspicious Calls**:\n"
+        for s in code_snippets:
+            data_context += f"\n--- {s['file']} (line {s['line']}, API: {s['api']}) ---\n```java\n{s['code']}\n```\n"
+
+    if manifest_snippet:
+        data_context += f"\n**AndroidManifest.xml (excerpt)**:\n```xml\n{manifest_snippet}\n```\n"
+
+    if dynamic_logs:
+        data_context += "\n**Dynamic Analysis Logs (Frida Intercepts at Runtime)**:\n"
+        if len(dynamic_logs) > 0:
+            for log in dynamic_logs[:20]: # Cap to 20 lines to save tokens
+                data_context += f"- {log}\n"
+        else:
+            data_context += "- App was executed, but no suspicious behavior was intercepted by the hooks.\n"
+    else:
+        data_context += "\n**Dynamic Analysis Logs**: (Not performed - no sandbox available)\n"
+
+    system_prompt = """You are ARGUS, an expert Android malware analysis system composed of 6 specialized agents.
+Analyze the provided APK data and respond as each agent with specific, evidence-based findings.
+
+You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
+{
+  "perm": {
+    "summary": "one-line summary for the Permission Agent",
+    "detail": "2-3 sentence analysis of the permission landscape and risks"
+  },
+  "code": {
+    "summary": "one-line summary for the Code Agent",
+    "detail": "2-3 sentence analysis of suspicious code patterns and API usage"
+  },
+  "behavior": {
+    "summary": "one-line summary for the Behavior Agent",
+    "detail": "2-3 sentence analysis of potential behavioral patterns inferred from code"
+  },
+  "network": {
+    "summary": "one-line summary for the Network Agent",
+    "detail": "2-3 sentence analysis of network-related capabilities and risks"
+  },
+  "threat": {
+    "summary": "one-line summary for the Threat Intelligence Agent",
+    "detail": "2-3 sentence analysis correlating findings with known threat patterns/MITRE ATT&CK"
+  },
+  "consensus": {
+    "summary": "one-line summary for the Consensus Agent (e.g. 'Verdict: suspicious')",
+    "detail": "2-3 sentence final synthesis"
+  }
+}
+
+Be specific and reference actual findings from the data. Do not make up capabilities not evidenced in the data."""
+
+    try:
+        print("[LLM] Sending 6-agent analysis request...", flush=True)
+        response = llm_client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": data_context},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        raw = response.choices[0].message.content.strip()
+        print(f"[LLM] Agent analysis received ({len(raw)} chars)", flush=True)
+
+        # Try to parse JSON (handle markdown fences if present)
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        agent_findings = json.loads(raw)
+        return agent_findings
+    except json.JSONDecodeError as e:
+        print(f"[LLM] JSON parse error: {e}\nRaw response: {raw[:500]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[LLM] Agent analysis error: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def run_consensus(agent_findings, package_name, high_risk, api_calls, score):
+    """Generate final verdict, confidence, executive summary, and recommendations."""
+    if not llm_client or not agent_findings:
+        return None
+
+    agent_summaries = "\n".join(
+        f"- **{k.title()} Agent**: {v.get('detail', v.get('summary', 'N/A'))}"
+        for k, v in agent_findings.items()
+    )
+
+    system_prompt = """You are the ARGUS Consensus Engine. Given the findings from 6 specialized agents analyzing an Android APK, produce a final verdict.
+
+You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
+{
+  "verdict": "benign" | "suspicious" | "malicious",
+  "confidence": 0-100,
+  "executive_summary": "A 3-5 sentence executive summary of the analysis findings and conclusion.",
+  "recommended_actions": "2-3 specific recommended actions based on the verdict.",
+  "mitre_techniques": ["T1234: Technique Name", ...]
+}
+
+Base confidence on the strength and consistency of evidence. Be precise."""
+
+    user_msg = f"""## Agent Findings for {package_name}
+
+{agent_summaries}
+
+**Rule-based risk score**: {score}%
+**High-risk permissions**: {len(high_risk)}
+**Suspicious API calls**: {len(api_calls)}"""
+
+    try:
+        print("[LLM] Sending consensus request...", flush=True)
+        response = llm_client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=1000,
+        )
+        raw = response.choices[0].message.content.strip()
+        print(f"[LLM] Consensus received ({len(raw)} chars)", flush=True)
+
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        consensus = json.loads(raw)
+        return consensus
+    except json.JSONDecodeError as e:
+        print(f"[LLM] Consensus JSON parse error: {e}\nRaw: {raw[:500]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[LLM] Consensus error: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# ---------- Routes ----------
+
 @app.route('/analyze', methods=['POST'])
 def analyze_apk():
     print(f"\n{'='*60}", flush=True)
-    print(f"[analyze_apk] REQUEST RECEIVED - file in request.files: {'file' in request.files}", flush=True)
+    print(f"[analyze_apk] REQUEST RECEIVED", flush=True)
     if 'file' not in request.files:
         return jsonify({'error': 'no file provided'}), 400
     f = request.files['file']
@@ -151,52 +354,105 @@ def analyze_apk():
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk')
     os.close(tmp_fd)
-    
-    # Create temp dirs for tools
     apktool_out = tempfile.mkdtemp(prefix='apktool_')
     jadx_out = tempfile.mkdtemp(prefix='jadx_')
-    
+
     try:
         f.save(tmp_path)
-        
+
         # 1. Androguard Permissions
         apk = APK(tmp_path)
-        permissions = apk.get_permissions() or []
+        package_name = apk.get_package() or "unknown"
+        permissions = list(apk.get_permissions() or [])
         used_high_risk = [p for p in permissions if p in HIGH_RISK_PERMISSIONS]
-        
+
         # 2. APKtool extraction
         apktool_success, apktool_msg = run_apktool(tmp_path, apktool_out)
-        
+
         # 3. JADX decompilation
         jadx_success, jadx_msg = run_jadx(tmp_path, jadx_out)
-        
+
         # 4. API call extraction
         api_calls = []
         if jadx_success:
             api_calls = extract_api_calls_from_source(jadx_out)
-            
-        # Scoring logic
+
+        # 5. Collect code snippets for LLM context
+        code_snippets = []
+        if jadx_success:
+            code_snippets = collect_code_snippets(jadx_out, api_calls)
+
+        # 6. Read manifest snippet for LLM context
+        manifest_snippet = ""
+        manifest_path = os.path.join(apktool_out, "AndroidManifest.xml")
+        if apktool_success and os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8', errors='ignore') as mf:
+                    manifest_snippet = mf.read()[:3000]  # cap at 3KB
+            except Exception:
+                pass
+
+        # 7. Dynamic Analysis (Phase 2)
+        dynamic_logs = None
+        sandbox = SandboxOrchestrator()
+        sandbox_status = {'success': False, 'message': 'No emulator connected'}
+        if sandbox.check_emulator():
+            # Run sandbox for 10 seconds to gather quick behavioral intel
+            print("[analyze_apk] Sandbox starting...", flush=True)
+            sandbox_res = sandbox.run_dynamic_analysis(package_name, tmp_path, duration_seconds=10)
+            sandbox_status['success'] = sandbox_res['success']
+            sandbox_status['message'] = 'Sandbox execution complete' if sandbox_res['success'] else sandbox_res.get('error', 'Failed')
+            dynamic_logs = sandbox_res.get('logs', [])
+            print(f"[analyze_apk] Sandbox collected {len(dynamic_logs)} logs.", flush=True)
+
+        # 8. Rule-based score (kept as baseline)
         score = 0
         if permissions:
-            score += (len(used_high_risk) / len(permissions)) * 60  # max 60% from permissions
-            
+            score += (len(used_high_risk) / len(permissions)) * 60
         if api_calls:
-            # max 40% from API calls (each suspicious API adds 10%)
             score += min(40, len(api_calls) * 10)
-            
+        # Give a small bump if dynamic analysis caught something
+        if dynamic_logs and len(dynamic_logs) > 0:
+            score = min(99, score + 15)
+        score = round(score, 2)
+
+        # 9. LLM Analysis
+        agent_findings = run_llm_analysis(
+            package_name, permissions, used_high_risk, api_calls, code_snippets, manifest_snippet, dynamic_logs
+        )
+
+        # 10. LLM Consensus
+        consensus = run_consensus(agent_findings, package_name, used_high_risk, api_calls, score)
+
+        # Build response
         result = {
-            'package': apk.get_package(),
+            'package': package_name,
             'permissions': permissions,
             'high_risk_permissions': used_high_risk,
             'api_calls': api_calls,
+            'dynamic_logs': dynamic_logs,
             'pipeline_status': {
                 'apktool': {'success': apktool_success, 'message': apktool_msg},
-                'jadx': {'success': jadx_success, 'message': jadx_msg}
+                'jadx': {'success': jadx_success, 'message': jadx_msg},
+                'sandbox': sandbox_status
             },
-            'permission_score_percent': round(score, 2),
+            'permission_score_percent': score,
         }
+
+        # Add LLM results if available
+        if agent_findings:
+            result['agent_findings'] = agent_findings
+        if consensus:
+            result['verdict'] = consensus.get('verdict', None)
+            result['confidence'] = consensus.get('confidence', None)
+            result['executive_summary'] = consensus.get('executive_summary', None)
+            result['recommended_actions'] = consensus.get('recommended_actions', None)
+            result['mitre_techniques'] = consensus.get('mitre_techniques', [])
+
+        print(f"[analyze_apk] DONE - verdict={result.get('verdict', 'N/A')}", flush=True)
         return jsonify(result)
     except Exception as e:
+        print(f"[analyze_apk] ERROR: {type(e).__name__}: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
     finally:
         try:
@@ -205,6 +461,66 @@ def analyze_apk():
             shutil.rmtree(jadx_out, ignore_errors=True)
         except Exception:
             pass
+
+
+@app.route('/chat', methods=['POST'])
+def chat_followup():
+    """Handle follow-up questions about a completed analysis using DeepSeek."""
+    if not llm_client:
+        return jsonify({'answer': 'LLM is not configured. Set DEEPSEEK_API_KEY in .env'}), 200
+
+    data = request.get_json(silent=True) or {}
+    question = data.get('question', '').strip()
+    report_context = data.get('report_context', {})
+
+    if not question:
+        return jsonify({'error': 'No question provided'}), 400
+
+    system_prompt = """You are ARGUS, an Android APK security analysis assistant.
+You have just completed a multi-agent analysis of an APK and the user is asking follow-up questions.
+Answer based ONLY on the analysis data provided. Be specific, reference actual findings, and be concise (2-4 sentences).
+If asked about something not covered in the analysis, say so honestly."""
+
+    # Build context from the report
+    ctx_parts = [f"**Package**: {report_context.get('package', 'unknown')}"]
+    if report_context.get('verdict'):
+        ctx_parts.append(f"**Verdict**: {report_context['verdict']} ({report_context.get('confidence', '?')}% confidence)")
+    if report_context.get('executive_summary'):
+        ctx_parts.append(f"**Executive Summary**: {report_context['executive_summary']}")
+    if report_context.get('highRisk'):
+        ctx_parts.append(f"**High-Risk Permissions**: {', '.join(report_context['highRisk'])}")
+    if report_context.get('apiCalls'):
+        apis = [f"{a['api']} in {a['file']}" for a in report_context['apiCalls'][:10]]
+        ctx_parts.append(f"**Suspicious APIs**: {', '.join(apis)}")
+    if report_context.get('mitre_techniques'):
+        ctx_parts.append(f"**MITRE ATT&CK**: {', '.join(report_context['mitre_techniques'])}")
+    if report_context.get('agent_findings'):
+        for agent_id, finding in report_context['agent_findings'].items():
+            detail = finding.get('detail', finding.get('summary', ''))
+            ctx_parts.append(f"**{agent_id.title()} Agent**: {detail}")
+    if report_context.get('recommended_actions'):
+        ctx_parts.append(f"**Recommended Actions**: {report_context['recommended_actions']}")
+
+    context = "\n".join(ctx_parts)
+
+    try:
+        print(f"[chat] Question: {question[:100]}", flush=True)
+        response = llm_client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"## Analysis Context\n{context}\n\n## User Question\n{question}"},
+            ],
+            temperature=0.4,
+            max_tokens=500,
+        )
+        answer = response.choices[0].message.content.strip()
+        print(f"[chat] Answer: {answer[:100]}...", flush=True)
+        return jsonify({'answer': answer})
+    except Exception as e:
+        print(f"[chat] ERROR: {type(e).__name__}: {e}", flush=True)
+        return jsonify({'answer': f'Sorry, I encountered an error: {e}'}), 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5050)
