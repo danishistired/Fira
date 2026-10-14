@@ -8,20 +8,13 @@ import {
   Scripts,
 } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
+import { Home } from "./_argus.index";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 
 function NotFoundComponent() {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4">
-      <div className="max-w-md text-center">
-        <h1 className="text-7xl font-bold text-foreground">404</h1>
-        <p className="mt-4 text-sm text-muted-foreground">Signal lost. This sector is empty.</p>
-        <Link to="/" className="mt-6 inline-block rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Return to ARGUS</Link>
-      </div>
-    </div>
-  );
+  return <Home />;
 }
 
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {

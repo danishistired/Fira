@@ -1,0 +1,7 @@
+services:
+  analysis:
+    build: ./analysis
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./analysis:/app

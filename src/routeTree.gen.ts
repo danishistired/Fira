@@ -10,7 +10,6 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ArgusRouteImport } from './routes/_argus'
-import { Route as ArgusIndexRouteImport } from './routes/_argus.index'
 import { Route as ArgusThreatMapRouteImport } from './routes/_argus.threat-map'
 import { Route as ArgusSubmissionsRouteImport } from './routes/_argus.submissions'
 import { Route as ArgusSettingsRouteImport } from './routes/_argus.settings'
@@ -22,11 +21,6 @@ import { Route as ArgusAgentsRouteImport } from './routes/_argus.agents'
 const ArgusRoute = ArgusRouteImport.update({
   id: '/_argus',
   getParentRoute: () => rootRouteImport,
-} as any)
-const ArgusIndexRoute = ArgusIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => ArgusRoute,
 } as any)
 const ArgusThreatMapRoute = ArgusThreatMapRouteImport.update({
   id: '/threat-map',
@@ -65,7 +59,7 @@ const ArgusAgentsRoute = ArgusAgentsRouteImport.update({
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof ArgusIndexRoute
+  '/': typeof ArgusRouteWithChildren
   '/agents': typeof ArgusAgentsRoute
   '/analysis': typeof ArgusAnalysisRoute
   '/knowledge-graph': typeof ArgusKnowledgeGraphRoute
@@ -75,6 +69,7 @@ export interface FileRoutesByFullPath {
   '/threat-map': typeof ArgusThreatMapRoute
 }
 export interface FileRoutesByTo {
+  '/': typeof ArgusRouteWithChildren
   '/agents': typeof ArgusAgentsRoute
   '/analysis': typeof ArgusAnalysisRoute
   '/knowledge-graph': typeof ArgusKnowledgeGraphRoute
@@ -82,7 +77,6 @@ export interface FileRoutesByTo {
   '/settings': typeof ArgusSettingsRoute
   '/submissions': typeof ArgusSubmissionsRoute
   '/threat-map': typeof ArgusThreatMapRoute
-  '/': typeof ArgusIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -94,7 +88,6 @@ export interface FileRoutesById {
   '/_argus/settings': typeof ArgusSettingsRoute
   '/_argus/submissions': typeof ArgusSubmissionsRoute
   '/_argus/threat-map': typeof ArgusThreatMapRoute
-  '/_argus/': typeof ArgusIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -109,6 +102,7 @@ export interface FileRouteTypes {
     | '/threat-map'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/'
     | '/agents'
     | '/analysis'
     | '/knowledge-graph'
@@ -116,7 +110,6 @@ export interface FileRouteTypes {
     | '/settings'
     | '/submissions'
     | '/threat-map'
-    | '/'
   id:
     | '__root__'
     | '/_argus'
@@ -127,7 +120,6 @@ export interface FileRouteTypes {
     | '/_argus/settings'
     | '/_argus/submissions'
     | '/_argus/threat-map'
-    | '/_argus/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -142,13 +134,6 @@ declare module '@tanstack/react-router' {
       fullPath: '/'
       preLoaderRoute: typeof ArgusRouteImport
       parentRoute: typeof rootRouteImport
-    }
-    '/_argus/': {
-      id: '/_argus/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof ArgusIndexRouteImport
-      parentRoute: typeof ArgusRoute
     }
     '/_argus/threat-map': {
       id: '/_argus/threat-map'
@@ -210,7 +195,6 @@ interface ArgusRouteChildren {
   ArgusSettingsRoute: typeof ArgusSettingsRoute
   ArgusSubmissionsRoute: typeof ArgusSubmissionsRoute
   ArgusThreatMapRoute: typeof ArgusThreatMapRoute
-  ArgusIndexRoute: typeof ArgusIndexRoute
 }
 
 const ArgusRouteChildren: ArgusRouteChildren = {
@@ -221,7 +205,6 @@ const ArgusRouteChildren: ArgusRouteChildren = {
   ArgusSettingsRoute: ArgusSettingsRoute,
   ArgusSubmissionsRoute: ArgusSubmissionsRoute,
   ArgusThreatMapRoute: ArgusThreatMapRoute,
-  ArgusIndexRoute: ArgusIndexRoute,
 }
 
 const ArgusRouteWithChildren = ArgusRoute._addFileChildren(ArgusRouteChildren)
@@ -232,3 +215,13 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
+
+import type { getRouter } from './router.tsx'
+import type { startInstance } from './start.ts'
+declare module '@tanstack/react-start' {
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+    config: Awaited<ReturnType<typeof startInstance.getOptions>>
+  }
+}
