@@ -39,6 +39,11 @@ type Report = {
   fileName: string;
   permissionScore: number;
   highRisk: string[];
+  apiCalls: { api: string; description: string; file: string }[];
+  pipelineStatus: {
+    apktool: { success: boolean; message: string };
+    jadx: { success: boolean; message: string };
+  };
   verdict: "benign" | "suspicious" | "malicious";
   confidence: number;
 } | null;
@@ -93,8 +98,38 @@ const makeConversation = (title = "New analysis"): Conversation => ({
 
 // ---------- component ----------
 export function Home() {
-  const [conversations, setConversations] = useState<Conversation[]>(() => [makeConversation("Untitled analysis")]);
-  const [activeId, setActiveId] = useState<string>(() => "");
+  const [conversations, setConversations] = useState<Conversation[]>([makeConversation("Untitled analysis")]);
+  const [activeId, setActiveId] = useState<string>("");
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+    if (typeof window !== "undefined") {
+      const savedConvs = localStorage.getItem("argus_conversations");
+      if (savedConvs) {
+        try {
+          const parsed = JSON.parse(savedConvs);
+          if (parsed && parsed.length > 0) setConversations(parsed);
+        } catch (e) {}
+      }
+      const savedActiveId = localStorage.getItem("argus_activeId");
+      if (savedActiveId) {
+        setActiveId(savedActiveId);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isMounted) {
+      localStorage.setItem("argus_conversations", JSON.stringify(conversations));
+    }
+  }, [conversations, isMounted]);
+
+  useEffect(() => {
+    if (isMounted) {
+      localStorage.setItem("argus_activeId", activeId);
+    }
+  }, [activeId, isMounted]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [input, setInput] = useState("");
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -176,7 +211,7 @@ export function Home() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const response = await fetch("http://localhost:5000/analyze", { method: "POST", body: form });
+      const response = await fetch("http://localhost:5050/analyze", { method: "POST", body: form });
       const result = await response.json();
       window.clearInterval(stepTimer);
       agentTimers.forEach(clearTimeout);
@@ -185,7 +220,12 @@ export function Home() {
 
       const highRisk: string[] = result.high_risk_permissions ?? [];
       const score: number = result.permission_score_percent ?? 0;
-      const verdict: Report extends infer R ? R extends { verdict: infer V } ? V : never : never =
+      const apiCalls = result.api_calls ?? [];
+      const pipelineStatus = result.pipeline_status ?? {
+        apktool: { success: false, message: "Not run" },
+        jadx: { success: false, message: "Not run" }
+      };
+      const verdict: "benign" | "suspicious" | "malicious" =
         score > 70 ? "malicious" : score > 40 ? "suspicious" : "benign";
 
       const summaries: Record<string, string> = {
@@ -211,6 +251,8 @@ export function Home() {
                   fileName: file.name,
                   permissionScore: score,
                   highRisk,
+                  apiCalls,
+                  pipelineStatus,
                   verdict,
                   confidence: Math.min(99, 60 + Math.round(score / 3)),
                 },
@@ -643,7 +685,7 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
         <Stat label="Verdict" value={report.verdict} valueClass={verdictColor} />
       </div>
 
-      <Section title="Threat Findings">
+      <Section title="Threat Findings (Permissions)">
         {report.highRisk.length === 0 ? (
           <span className="text-neutral-500">No high-risk capabilities detected.</span>
         ) : (
@@ -658,34 +700,49 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
         )}
       </Section>
 
-      <Section title="MITRE ATT&CK Mapping">
+      <Section title="Suspicious API Calls (Static Analysis)">
+        {!report.pipelineStatus?.jadx?.success ? (
+          <span className="text-amber-500">JADX static analysis skipped: {report.pipelineStatus?.jadx?.message}</span>
+        ) : report.apiCalls && report.apiCalls.length === 0 ? (
+          <span className="text-neutral-500">No suspicious API calls detected in the decompiled source.</span>
+        ) : (
+          <ul className="space-y-1">
+            {report.apiCalls?.map((api, i) => (
+              <li key={i} className="flex items-start gap-2">
+                <ChevronRight size={12} className="mt-1.5 text-neutral-600" />
+                <div>
+                  <div className="font-mono text-[12px] text-neutral-200">{api.api}</div>
+                  <div className="text-[11px] text-neutral-500">{api.description} (in {api.file})</div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+
+      <Section title="Pipeline Status (Phase 1)">
         <ul className="space-y-1 font-mono text-[12px]">
-          <li><span className="text-neutral-500">T1430</span> — Location Tracking</li>
-          <li><span className="text-neutral-500">T1437</span> — Application Layer Protocol</li>
-          <li><span className="text-neutral-500">T1417</span> — Input Capture</li>
+          <li>
+            <span className={report.pipelineStatus?.apktool?.success ? "text-emerald-400" : "text-amber-500"}>
+              [APKtool]
+            </span>{" "}
+            {report.pipelineStatus?.apktool?.message}
+          </li>
+          <li>
+            <span className={report.pipelineStatus?.jadx?.success ? "text-emerald-400" : "text-amber-500"}>
+              [JADX]
+            </span>{" "}
+            {report.pipelineStatus?.jadx?.message}
+          </li>
         </ul>
-      </Section>
-
-      <Section title="Behaviour Analysis">
-        No runtime anomalies were observed during sandbox execution. Process tree remained stable; no privileged
-        escalation attempts were recorded.
-      </Section>
-
-      <Section title="Network Analysis">
-        Outbound traffic profile captured. No connections matched known C2 indicators in the current intel feed.
-      </Section>
-
-      <Section title="Agent Consensus">
-        All six agents agreed on the final verdict with high confidence. Disagreement was limited to the permission
-        scoring weight applied by the Permission and Consensus agents.
       </Section>
 
       <Section title="Recommended Actions">
         {report.verdict === "malicious"
           ? "Quarantine the sample, revoke any associated certificates, and pivot on observed network indicators."
           : report.verdict === "suspicious"
-            ? "Hold the sample for manual review. Inspect the flagged permissions before promotion."
-            : "Sample is safe to release. Retain telemetry for baseline comparison."}
+            ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
+            : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
       </Section>
     </motion.article>
   );
