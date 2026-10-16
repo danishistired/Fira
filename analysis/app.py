@@ -56,16 +56,84 @@ HIGH_RISK_PERMISSIONS = {
     "android.permission.CALL_PHONE",
     "android.permission.WRITE_EXTERNAL_STORAGE",
     "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.PROCESS_OUTGOING_CALLS",
+    "android.permission.READ_PHONE_STATE",
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.GET_ACCOUNTS",
 }
 
+# ----------------------------------------------------------------
+# Patterns: API calls (string search in .java files)
+# ----------------------------------------------------------------
 SUSPICIOUS_API_PATTERNS = {
-    "SmsManager": "SMS Operations",
-    "Runtime.getRuntime().exec": "Command Execution",
-    "TelephonyManager.getDeviceId": "Device ID Extraction",
-    "getLastKnownLocation": "Location Tracking",
-    "MediaRecorder.start": "Audio/Video Recording",
-    "DexClassLoader": "Dynamic Code Loading",
-    "HttpURLConnection": "Network Connection",
+    # Telephony / SMS
+    "SmsManager":                      "SMS Operations",
+    "sendTextMessage":                  "SMS Sending",
+    "getSubscriberId":                  "IMSI Extraction",
+    "getDeviceId":                      "IMEI/Device ID Extraction",
+    "getLine1Number":                   "Phone Number Extraction",
+    # Command execution
+    "Runtime.getRuntime().exec":        "OS Command Execution",
+    "ProcessBuilder":                   "Process Spawning",
+    # Location
+    "getLastKnownLocation":             "Location Tracking",
+    "requestLocationUpdates":           "Continuous Location Tracking",
+    # Surveillance
+    "MediaRecorder":                    "Audio/Video Recording",
+    "Camera.open":                      "Camera Access",
+    # Dynamic code loading
+    "DexClassLoader":                   "Dynamic DEX Loading",
+    "PathClassLoader":                  "Dynamic Class Loading",
+    "loadClass":                        "Dynamic Class Loading",
+    # Network
+    "HttpURLConnection":                "HTTP Network Connection",
+    "OkHttpClient":                     "HTTP Network Connection",
+    "URL(\"http://":                    "Cleartext HTTP URL",
+    # WebView
+    "setJavaScriptEnabled(true)":       "WebView JS Enabled",
+    "addJavascriptInterface":           "WebView JS Interface (XSS Risk)",
+    "loadUrl(\"http://":               "WebView Cleartext Load",
+    "setWebContentsDebuggingEnabled":   "WebView Remote Debugging Enabled",
+    # Crypto
+    "MD5":                              "Weak Hash: MD5",
+    "getInstance(\"MD5\")":             "Weak Hash: MD5",
+    "getInstance(\"SHA-1\")":           "Weak Hash: SHA-1",
+    "getInstance(\"DES\")":             "Weak Cipher: DES",
+    "getInstance(\"RC4\")":             "Weak Cipher: RC4",
+    "ECB":                              "Insecure Cipher Mode: ECB",
+    "NoPadding":                        "No Padding (potential ECB/insecure crypto)",
+    # Logging
+    "Log.d(":                           "Debug Logging",
+    "Log.i(":                           "Info Logging",
+    "Log.e(":                           "Error Logging",
+    "Log.v(":                           "Verbose Logging",
+    "System.out.println":               "Console Print (potential info leak)",
+    # Root detection / evasion
+    "su\",":                            "Root Check (su binary)",
+    "RootBeer":                         "Root Detection Library",
+    "isRooted":                         "Root Detection",
+    "detect_emulator":                  "Emulator Detection",
+    "Build.FINGERPRINT":                "Emulator/Device Fingerprint Check",
+    # Keystore / crypto storage
+    "SharedPreferences":                "SharedPreferences (potential plaintext storage)",
+    "getSharedPreferences":             "SharedPreferences Access",
+    # Reflection / obfuscation
+    "java.lang.reflect":                "Java Reflection (obfuscation risk)",
+    "invoke(":                          "Reflective Method Invocation",
+    # File operations
+    "openFileOutput(":                  "File Write",
+    "getExternalStorageDirectory":      "External Storage Access",
+    # Clipboard
+    "ClipboardManager":                 "Clipboard Access",
+    # Accessibility
+    "AccessibilityService":             "Accessibility Service (spyware risk)",
+    "onAccessibilityEvent":             "Accessibility Event Hook",
+    # Device admin
+    "DevicePolicyManager":              "Device Admin API",
+    "lockNow":                          "Device Lock Call",
 }
 
 from pathlib import Path
@@ -124,24 +192,176 @@ def run_jadx(apk_path, out_dir):
         return False, f"JADX exception: {e}"
 
 def extract_api_calls_from_source(source_dir):
+    """Scan decompiled Java source for suspicious API usage."""
     found_apis = []
     if not os.path.exists(source_dir):
         return found_apis
+    seen = set()
     for root, _, files in os.walk(source_dir):
         for f in files:
-            if f.endswith('.java'):
-                file_path = os.path.join(root, f)
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
-                        content = fp.read()
-                        for pattern, desc in SUSPICIOUS_API_PATTERNS.items():
-                            if pattern in content:
-                                entry = {"api": pattern, "description": desc, "file": f}
-                                if entry not in found_apis:
-                                    found_apis.append(entry)
-                except Exception:
-                    pass
+            if not f.endswith('.java'):
+                continue
+            file_path = os.path.join(root, f)
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
+                    content = fp.read()
+                    for pattern, desc in SUSPICIOUS_API_PATTERNS.items():
+                        if pattern in content:
+                            key = (pattern, f)
+                            if key not in seen:
+                                seen.add(key)
+                                found_apis.append({"api": pattern, "description": desc, "file": f})
+            except Exception:
+                pass
     return found_apis
+
+
+import re
+
+# Patterns that suggest hardcoded secrets in Java source
+HARDCODED_SECRET_PATTERNS = [
+    (re.compile(r'(?i)(password|passwd|pwd)\s*=\s*"([^"]{4,})"'),       "Hardcoded Password"),
+    (re.compile(r'(?i)(api_?key|apikey|api_?secret)\s*=\s*"([^"]{6,})"'),"Hardcoded API Key"),
+    (re.compile(r'(?i)(secret|token)\s*=\s*"([^"]{6,})"'),              "Hardcoded Secret/Token"),
+    (re.compile(r'(?i)(username|user_name|uname)\s*=\s*"([^"]{3,})"'),  "Hardcoded Username"),
+    (re.compile(r'(?i)(private_?key|privatekey)\s*=\s*"([^"]{8,})"'),   "Hardcoded Private Key"),
+    (re.compile(r'(?i)\.equals\s*\(\s*"(admin|developer|test|debug|root|password|1234|letmein)"'), "Backdoor Credential Check"),
+]
+
+def scan_hardcoded_secrets(source_dir):
+    """Scan decompiled Java source for hardcoded secrets using regex."""
+    findings = []
+    if not os.path.exists(source_dir):
+        return findings
+    seen = set()
+    for root, _, files in os.walk(source_dir):
+        for fname in files:
+            if not fname.endswith('.java'):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
+                    for lineno, line in enumerate(fp, 1):
+                        for pattern, label in HARDCODED_SECRET_PATTERNS:
+                            match = pattern.search(line)
+                            if match:
+                                # Redact the actual secret value in output
+                                key = (label, fname)
+                                if key not in seen:
+                                    seen.add(key)
+                                    findings.append({
+                                        "type": label,
+                                        "file": fname,
+                                        "line": lineno,
+                                        "snippet": line.strip()[:120],
+                                    })
+            except Exception:
+                pass
+    return findings
+
+
+def analyze_manifest_vulnerabilities(apk):
+    """
+    Use Androguard's parsed APK object to extract manifest-level
+    vulnerability indicators. Returns a structured dict.
+    """
+    vulns = []
+
+    # 1. Debuggable flag
+    try:
+        if apk.get_attribute_value('application', 'debuggable') == 'true':
+            vulns.append({
+                "id": "MANIFEST_DEBUGGABLE",
+                "severity": "HIGH",
+                "title": "Application Debuggable",
+                "detail": "android:debuggable=\"true\" — attackers can attach a debugger to the running process and inspect memory.",
+            })
+    except Exception:
+        pass
+
+    # 2. Allow Backup flag
+    try:
+        allow_backup = apk.get_attribute_value('application', 'allowBackup')
+        if allow_backup != 'false':   # default is true if not set
+            vulns.append({
+                "id": "MANIFEST_ALLOW_BACKUP",
+                "severity": "MEDIUM",
+                "title": "Android Backup Enabled",
+                "detail": f"android:allowBackup=\"{allow_backup or 'true (default)'}\" — application data can be extracted via ADB backup without root.",
+            })
+    except Exception:
+        pass
+
+    # 3. Network Security Config / cleartext traffic
+    try:
+        if apk.get_attribute_value('application', 'usesCleartextTraffic') == 'true':
+            vulns.append({
+                "id": "MANIFEST_CLEARTEXT_TRAFFIC",
+                "severity": "MEDIUM",
+                "title": "Cleartext Network Traffic Allowed",
+                "detail": "android:usesCleartextTraffic=\"true\" — app explicitly permits unencrypted HTTP traffic, enabling MITM attacks.",
+            })
+    except Exception:
+        pass
+
+    # 4. Exported components (Activities, Services, Receivers, Providers)
+    exported_components = []
+    try:
+        for activity in apk.get_activities():
+            exported = apk.get_attribute_value('activity', 'exported', className=activity)
+            if exported == 'true':
+                exported_components.append(("Activity", activity))
+    except Exception:
+        pass
+    try:
+        for service in apk.get_services():
+            exported = apk.get_attribute_value('service', 'exported', className=service)
+            if exported == 'true':
+                exported_components.append(("Service", service))
+    except Exception:
+        pass
+    try:
+        for receiver in apk.get_receivers():
+            exported = apk.get_attribute_value('receiver', 'exported', className=receiver)
+            if exported == 'true':
+                exported_components.append(("Receiver", receiver))
+    except Exception:
+        pass
+    try:
+        for provider in apk.get_providers():
+            exported = apk.get_attribute_value('provider', 'exported', className=provider)
+            if exported == 'true':
+                exported_components.append(("Provider (Content Provider)", provider))
+    except Exception:
+        pass
+
+    if exported_components:
+        component_list = "; ".join(f"{ctype}: {cname}" for ctype, cname in exported_components[:10])
+        vulns.append({
+            "id": "MANIFEST_EXPORTED_COMPONENTS",
+            "severity": "HIGH" if len(exported_components) > 3 else "MEDIUM",
+            "title": f"Exported Components ({len(exported_components)} found)",
+            "detail": f"Components accessible to other apps without permission: {component_list}",
+        })
+
+    # 5. Insecure Content Providers (exported + no readPermission/writePermission)
+    try:
+        for provider in apk.get_providers():
+            exported = apk.get_attribute_value('provider', 'exported', className=provider)
+            read_perm = apk.get_attribute_value('provider', 'readPermission', className=provider)
+            write_perm = apk.get_attribute_value('provider', 'writePermission', className=provider)
+            if exported == 'true' and not read_perm and not write_perm:
+                vulns.append({
+                    "id": "MANIFEST_UNPROTECTED_PROVIDER",
+                    "severity": "HIGH",
+                    "title": "Unprotected Content Provider",
+                    "detail": f"Content provider '{provider}' is exported but has no readPermission or writePermission set — any app can read/write its data.",
+                })
+    except Exception:
+        pass
+
+    return vulns
+
 
 def collect_code_snippets(source_dir, api_calls, max_snippets=10, context_lines=5):
     """Collect short code snippets around suspicious API calls for LLM context."""
@@ -180,10 +400,14 @@ def collect_code_snippets(source_dir, api_calls, max_snippets=10, context_lines=
 
 # ---------- LLM Analysis Functions ----------
 
-def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snippets, manifest_snippet="", dynamic_logs=None):
+def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snippets,
+                     manifest_snippet="", dynamic_logs=None, manifest_vulns=None, hardcoded_secrets=None):
     """Run a batched 6-agent analysis via DeepSeek. Returns per-agent findings."""
     if not llm_client:
         return None
+
+    manifest_vulns = manifest_vulns or []
+    hardcoded_secrets = hardcoded_secrets or []
 
     # Build the data context for the LLM
     data_context = f"""## APK Analysis Data
@@ -194,10 +418,16 @@ def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snipp
 {chr(10).join(f'- {p}' for p in permissions)}
 
 **High-Risk Permissions** ({len(high_risk)}):
-{chr(10).join(f'- {p}' for p in high_risk)}
+{chr(10).join(f'- {p}' for p in high_risk) if high_risk else '- None'}
 
 **Suspicious API Calls** ({len(api_calls)}):
-{chr(10).join(f'- {a["api"]} ({a["description"]}) in {a["file"]}' for a in api_calls)}
+{chr(10).join(f'- {a["api"]} ({a["description"]}) in {a["file"]}' for a in api_calls) if api_calls else '- None detected'}
+
+**Manifest Vulnerabilities** ({len(manifest_vulns)} found):
+{chr(10).join(f'- [{v["severity"]}] {v["title"]}: {v["detail"]}' for v in manifest_vulns) if manifest_vulns else '- None detected'}
+
+**Hardcoded Secrets / Backdoor Patterns** ({len(hardcoded_secrets)} found):
+{chr(10).join(f'- {s["type"]} in {s["file"]} (line {s["line"]}): {s["snippet"]}' for s in hardcoded_secrets) if hardcoded_secrets else '- None detected'}
 """
 
     if code_snippets:
@@ -377,12 +607,22 @@ def analyze_apk():
         if jadx_success:
             api_calls = extract_api_calls_from_source(jadx_out)
 
-        # 5. Collect code snippets for LLM context
+        # 5. Manifest vulnerability analysis (via Androguard)
+        manifest_vulns = analyze_manifest_vulnerabilities(apk)
+        print(f"[analyze_apk] manifest_vulns found: {len(manifest_vulns)}", flush=True)
+
+        # 6. Collect code snippets for LLM context
         code_snippets = []
         if jadx_success:
             code_snippets = collect_code_snippets(jadx_out, api_calls)
 
-        # 6. Read manifest snippet for LLM context
+        # 7. Hardcoded secrets scan (via regex on JADX output)
+        hardcoded_secrets = []
+        if jadx_success:
+            hardcoded_secrets = scan_hardcoded_secrets(jadx_out)
+        print(f"[analyze_apk] hardcoded_secrets found: {len(hardcoded_secrets)}", flush=True)
+
+        # 8. Read raw manifest for LLM context (APKtool output)
         manifest_snippet = ""
         manifest_path = os.path.join(apktool_out, "AndroidManifest.xml")
         if apktool_success and os.path.exists(manifest_path):
@@ -405,23 +645,28 @@ def analyze_apk():
             dynamic_logs = sandbox_res.get('logs', [])
             print(f"[analyze_apk] Sandbox collected {len(dynamic_logs)} logs.", flush=True)
 
-        # 8. Rule-based score (kept as baseline)
+        # 9. Rule-based score (kept as baseline)
         score = 0
         if permissions:
-            score += (len(used_high_risk) / len(permissions)) * 60
+            score += (len(used_high_risk) / len(permissions)) * 50
         if api_calls:
-            score += min(40, len(api_calls) * 10)
-        # Give a small bump if dynamic analysis caught something
+            score += min(30, len(api_calls) * 3)
+        # Manifest vulns add directly to score
+        high_manifest_vulns = [v for v in manifest_vulns if v.get('severity') == 'HIGH']
+        score += min(15, len(high_manifest_vulns) * 5)
+        if hardcoded_secrets:
+            score += min(10, len(hardcoded_secrets) * 5)
         if dynamic_logs and len(dynamic_logs) > 0:
             score = min(99, score + 15)
-        score = round(score, 2)
+        score = round(min(99, score), 2)
 
-        # 9. LLM Analysis
+        # 10. LLM Analysis
         agent_findings = run_llm_analysis(
-            package_name, permissions, used_high_risk, api_calls, code_snippets, manifest_snippet, dynamic_logs
+            package_name, permissions, used_high_risk, api_calls, code_snippets,
+            manifest_snippet, dynamic_logs, manifest_vulns, hardcoded_secrets
         )
 
-        # 10. LLM Consensus
+        # 11. LLM Consensus
         consensus = run_consensus(agent_findings, package_name, used_high_risk, api_calls, score)
 
         # Build response
@@ -430,6 +675,8 @@ def analyze_apk():
             'permissions': permissions,
             'high_risk_permissions': used_high_risk,
             'api_calls': api_calls,
+            'manifest_vulnerabilities': manifest_vulns,
+            'hardcoded_secrets': hardcoded_secrets,
             'dynamic_logs': dynamic_logs,
             'pipeline_status': {
                 'apktool': {'success': apktool_success, 'message': apktool_msg},
