@@ -84,10 +84,9 @@ SUSPICIOUS_API_PATTERNS = {
     # Surveillance
     "MediaRecorder":                    "Audio/Video Recording",
     "Camera.open":                      "Camera Access",
-    # Dynamic code loading
-    "DexClassLoader":                   "Dynamic DEX Loading",
+    # Dynamic code loading (DexClassLoader is high-signal; loadClass removed — too noisy)
+    "DexClassLoader":                   "Dynamic DEX Loading (HIGH)",
     "PathClassLoader":                  "Dynamic Class Loading",
-    "loadClass":                        "Dynamic Class Loading",
     # Network
     "HttpURLConnection":                "HTTP Network Connection",
     "OkHttpClient":                     "HTTP Network Connection",
@@ -112,7 +111,7 @@ SUSPICIOUS_API_PATTERNS = {
     "Log.v(":                           "Verbose Logging",
     "System.out.println":               "Console Print (potential info leak)",
     # Root detection / evasion
-    "su\",":                            "Root Check (su binary)",
+    "su\"":                             "Root Check (su binary)",
     "RootBeer":                         "Root Detection Library",
     "isRooted":                         "Root Detection",
     "detect_emulator":                  "Emulator Detection",
@@ -120,7 +119,7 @@ SUSPICIOUS_API_PATTERNS = {
     # Keystore / crypto storage
     "SharedPreferences":                "SharedPreferences (potential plaintext storage)",
     "getSharedPreferences":             "SharedPreferences Access",
-    # Reflection / obfuscation
+    # Reflection / obfuscation (only flagged in app code, filtered from libraries)
     "java.lang.reflect":                "Java Reflection (obfuscation risk)",
     "invoke(":                          "Reflective Method Invocation",
     # File operations
@@ -134,7 +133,22 @@ SUSPICIOUS_API_PATTERNS = {
     # Device admin
     "DevicePolicyManager":              "Device Admin API",
     "lockNow":                          "Device Lock Call",
+    # Intent / Broadcast (sniffing & injection risk)
+    "registerReceiver":                 "Dynamic BroadcastReceiver Registration",
+    "sendBroadcast":                    "Broadcast Intent Sending",
+    "sendOrderedBroadcast":             "Ordered Broadcast Sending",
+    "startActivity(":                   "Activity Launch (potential Intent injection)",
+    "getIntent(":                       "Intent Data Read",
 }
+
+# Patterns that should be SUPPRESSED when found inside standard library paths
+# (android.support.*, com.google.*, androidx.*)
+LIBRARY_NOISE_PATTERNS = {"java.lang.reflect", "invoke("}
+LIBRARY_PATH_PREFIXES = (
+    "android/support/", "androidx/", "com/google/",
+    "com/squareup/", "okhttp3/", "okio/",
+    "org/apache/", "kotlin/", "kotlinx/",
+)
 
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -192,12 +206,17 @@ def run_jadx(apk_path, out_dir):
         return False, f"JADX exception: {e}"
 
 def extract_api_calls_from_source(source_dir):
-    """Scan decompiled Java source for suspicious API usage."""
+    """Scan decompiled Java source for suspicious API usage.
+    Filters out reflection/invoke hits from standard library paths to reduce noise."""
     found_apis = []
     if not os.path.exists(source_dir):
         return found_apis
     seen = set()
     for root, _, files in os.walk(source_dir):
+        # Determine if this file lives inside a known library path
+        rel_path = os.path.relpath(root, source_dir).replace("\\", "/")
+        is_library = any(rel_path.startswith(pfx) or f"/{pfx}" in rel_path
+                         for pfx in LIBRARY_PATH_PREFIXES)
         for f in files:
             if not f.endswith('.java'):
                 continue
@@ -206,6 +225,9 @@ def extract_api_calls_from_source(source_dir):
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
                     content = fp.read()
                     for pattern, desc in SUSPICIOUS_API_PATTERNS.items():
+                        # Skip noisy patterns when inside library code
+                        if is_library and pattern in LIBRARY_NOISE_PATTERNS:
+                            continue
                         if pattern in content:
                             key = (pattern, f)
                             if key not in seen:
@@ -220,12 +242,15 @@ import re
 
 # Patterns that suggest hardcoded secrets in Java source
 HARDCODED_SECRET_PATTERNS = [
-    (re.compile(r'(?i)(password|passwd|pwd)\s*=\s*"([^"]{4,})"'),       "Hardcoded Password"),
+    (re.compile(r'(?i)(password|passwd|pwd)\s*=\s*"([^"]{4,})"'),        "Hardcoded Password"),
     (re.compile(r'(?i)(api_?key|apikey|api_?secret)\s*=\s*"([^"]{6,})"'),"Hardcoded API Key"),
-    (re.compile(r'(?i)(secret|token)\s*=\s*"([^"]{6,})"'),              "Hardcoded Secret/Token"),
-    (re.compile(r'(?i)(username|user_name|uname)\s*=\s*"([^"]{3,})"'),  "Hardcoded Username"),
-    (re.compile(r'(?i)(private_?key|privatekey)\s*=\s*"([^"]{8,})"'),   "Hardcoded Private Key"),
-    (re.compile(r'(?i)\.equals\s*\(\s*"(admin|developer|test|debug|root|password|1234|letmein)"'), "Backdoor Credential Check"),
+    (re.compile(r'(?i)(secret|token)\s*=\s*"([^"]{6,})"'),               "Hardcoded Secret/Token"),
+    (re.compile(r'(?i)(username|user_name|uname)\s*=\s*"([^"]{3,})"'),   "Hardcoded Username"),
+    (re.compile(r'(?i)(private_?key|privatekey)\s*=\s*"([^"]{8,})"'),    "Hardcoded Private Key"),
+    (re.compile(r'(?i)(master.?password|admin.?pass|dev.?pass)\s*=\s*"([^"]{3,})"'), "Developer/Master Password"),
+    (re.compile(r'(?i)\.equals\s*\(\s*"(admin|developer|test|debug|root|password|default|master|1234|letmein|qwerty|changeme)"'), "Backdoor Credential Check"),
+    (re.compile(r'"http://\d+\.\d+\.\d+\.\d+'),                         "Hardcoded IP Address URL"),
+    (re.compile(r'(?i)(db_?password|database_?pass|mysql_?pass)\s*=\s*"([^"]{3,})"'), "Hardcoded Database Password"),
 ]
 
 def scan_hardcoded_secrets(source_dir):
@@ -451,6 +476,14 @@ def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snipp
     system_prompt = """You are ARGUS, an expert Android malware analysis system composed of 6 specialized agents.
 Analyze the provided APK data and respond as each agent with specific, evidence-based findings.
 
+CRITICAL ANALYSIS CONSTRAINTS:
+- This is STATIC ANALYSIS ONLY. No dynamic/runtime analysis was performed.
+- You can prove CAPABILITY (the code exists) but NOT OBSERVED BEHAVIOR (it actually runs).
+- Distinguish between "the app CAN send SMS" vs "the app DOES send SMS" — always use the former.
+- Findings in standard library code (android.support.*, com.google.*, androidx.*) are LOWER priority than app-specific code.
+- If a vulnerability is a manifest misconfiguration (debuggable, allowBackup, exported components), state it as a configuration vulnerability, not proof of malicious intent.
+- Consider that the app might be a deliberately vulnerable test/training application if the package name suggests it.
+
 You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
 {
   "perm": {
@@ -463,7 +496,7 @@ You MUST respond with valid JSON only (no markdown fences, no extra text). Use t
   },
   "behavior": {
     "summary": "one-line summary for the Behavior Agent",
-    "detail": "2-3 sentence analysis of potential behavioral patterns inferred from code"
+    "detail": "2-3 sentence analysis of POTENTIAL behavioral patterns inferred from static code. Use phrases like 'capable of' or 'code exists to' rather than asserting observed behavior."
   },
   "network": {
     "summary": "one-line summary for the Network Agent",
@@ -475,7 +508,7 @@ You MUST respond with valid JSON only (no markdown fences, no extra text). Use t
   },
   "consensus": {
     "summary": "one-line summary for the Consensus Agent (e.g. 'Verdict: suspicious')",
-    "detail": "2-3 sentence final synthesis"
+    "detail": "2-3 sentence final synthesis that explicitly states what can and cannot be concluded from static analysis alone."
   }
 }
 
@@ -510,7 +543,7 @@ Be specific and reference actual findings from the data. Do not make up capabili
         return None
 
 
-def run_consensus(agent_findings, package_name, high_risk, api_calls, score):
+def run_consensus(agent_findings, package_name, high_risk, api_calls, score, dynamic_ran=False):
     """Generate final verdict, confidence, executive summary, and recommendations."""
     if not llm_client or not agent_findings:
         return None
@@ -520,18 +553,40 @@ def run_consensus(agent_findings, package_name, high_risk, api_calls, score):
         for k, v in agent_findings.items()
     )
 
-    system_prompt = """You are the ARGUS Consensus Engine. Given the findings from 6 specialized agents analyzing an Android APK, produce a final verdict.
+    # Determine what analysis phases were actually completed
+    has_dynamic = dynamic_ran
+
+    system_prompt = f"""You are the ARGUS Consensus Engine. Given the findings from 6 specialized agents analyzing an Android APK, produce a final verdict.
+
+ANALYSIS SCOPE: {"Static + Dynamic analysis" if has_dynamic else "Static analysis ONLY (no runtime/dynamic analysis was performed)"}
+
+VERDICT CALIBRATION RULES (YOU MUST FOLLOW THESE):
+- Use a 4-tier scale: "benign", "suspicious", "high-risk", "malicious"
+- "malicious" REQUIRES dynamic analysis confirming observed harmful behavior (data exfiltration, unauthorized network calls, actual SMS sending). If only static analysis was performed, you CANNOT use "malicious".
+- "high-risk" means: static analysis found dangerous capabilities, insecure configurations, and patterns consistent with known threat families, but no runtime confirmation. This is the MAXIMUM verdict for static-only analysis with strong findings.
+- "suspicious" means: some concerning patterns found but they could be legitimate.
+- "benign" means: no significant security concerns found.
+
+CONFIDENCE CALIBRATION RULES:
+- Static-only analysis: confidence MUST NOT exceed 85%, regardless of findings.
+- The confidence represents how certain you are about the VERDICT, not how many vulnerabilities you found.
+- Finding many vulnerabilities in a test/training app does NOT mean high malicious confidence.
+- If the package name suggests a deliberately vulnerable/test application, note this and adjust confidence downward for malware attribution.
+
+EXECUTIVE SUMMARY RULES:
+- Always state which analysis phases were completed and which were not.
+- Use "capable of" / "contains code for" instead of "performs" / "executes" when describing static findings.
+- End with a clear statement of limitations: "Dynamic validation has not yet been performed."
 
 You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
-{
-  "verdict": "benign" | "suspicious" | "malicious",
+{{
+  "verdict": "benign" | "suspicious" | "high-risk" | "malicious",
   "confidence": 0-100,
-  "executive_summary": "A 3-5 sentence executive summary of the analysis findings and conclusion.",
-  "recommended_actions": "2-3 specific recommended actions based on the verdict.",
+  "executive_summary": "A 3-5 sentence executive summary.",
+  "recommended_actions": "2-3 specific recommended actions.",
   "mitre_techniques": ["T1234: Technique Name", ...]
-}
-
-Base confidence on the strength and consistency of evidence. Be precise."""
+}}
+"""
 
     user_msg = f"""## Agent Findings for {package_name}
 
@@ -667,7 +722,8 @@ def analyze_apk():
         )
 
         # 11. LLM Consensus
-        consensus = run_consensus(agent_findings, package_name, used_high_risk, api_calls, score)
+        dynamic_ran = sandbox_status.get('success', False)
+        consensus = run_consensus(agent_findings, package_name, used_high_risk, api_calls, score, dynamic_ran=dynamic_ran)
 
         # Build response
         result = {

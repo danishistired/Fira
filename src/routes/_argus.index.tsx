@@ -46,7 +46,7 @@ type Report = {
     jadx: { success: boolean; message: string };
     sandbox: { success: boolean; message: string };
   };
-  verdict: "benign" | "suspicious" | "malicious";
+  verdict: "benign" | "suspicious" | "high-risk" | "malicious";
   confidence: number;
   executiveSummary?: string;
   recommendedActions?: string;
@@ -234,8 +234,8 @@ export function Home() {
         sandbox: { success: false, message: "Not run" }
       };
       // Use LLM verdict if available, otherwise fallback to rule-based
-      const verdict: "benign" | "suspicious" | "malicious" =
-        result.verdict ?? (score > 70 ? "malicious" : score > 40 ? "suspicious" : "benign");
+      const verdict: "benign" | "suspicious" | "high-risk" | "malicious" =
+        result.verdict ?? (score > 70 ? "high-risk" : score > 40 ? "suspicious" : "benign");
       const confidence: number = result.confidence ?? Math.min(99, 60 + Math.round(score / 3));
       const agentFindings: Record<string, AgentFinding> | undefined = result.agent_findings;
 
@@ -720,9 +720,11 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
   const verdictColor =
     report.verdict === "malicious"
       ? "text-red-400"
-      : report.verdict === "suspicious"
-        ? "text-amber-400"
-        : "text-emerald-400";
+      : report.verdict === "high-risk"
+        ? "text-orange-400"
+        : report.verdict === "suspicious"
+          ? "text-amber-400"
+          : "text-emerald-400";
   return (
     <motion.article
       initial={{ opacity: 0, y: 6 }}
@@ -830,9 +832,11 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
           ? report.recommendedActions
           : report.verdict === "malicious"
             ? "Quarantine the sample, revoke any associated certificates, and pivot on observed network indicators."
-            : report.verdict === "suspicious"
-              ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
-              : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
+            : report.verdict === "high-risk"
+              ? "Conduct dynamic analysis in a sandboxed environment to validate static findings. Do not deploy until runtime behavior is confirmed safe."
+              : report.verdict === "suspicious"
+                ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
+                : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
       </Section>
     </motion.article>
   );
