@@ -35,12 +35,37 @@ type TimelineEntry = {
   ts: number;
 };
 type ChatMsg = { role: "user" | "assistant"; text: string; id: string };
-type AgentFinding = { summary: string; detail: string };
+type FindingEntry = {
+  evidence: string;
+  source_file?: string;
+  interpretation: string;
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  runtime_validation: "NOT_TESTED" | "OBSERVED" | "VALIDATED";
+  mitre_technique?: string;
+  event_type?: string;
+  timestamp?: string;
+};
+type AgentFinding = {
+  summary: string;
+  detail?: string;
+  findings?: FindingEntry[];
+  observed_events?: { event_type: string; evidence: string; timestamp: string; interpretation: string }[];
+  observation_window_seconds?: number;
+  hooks_triggered?: number;
+  hooks_silent?: number;
+};
+type Correlation = {
+  capability: string;
+  static_evidence: string;
+  dynamic_evidence: string;
+  status: "VALIDATED" | "NOT_VALIDATED" | "NOT_TESTED";
+  risk_assessment: string;
+};
 type Report = {
   fileName: string;
   permissionScore: number;
   highRisk: string[];
-  apiCalls: { api: string; description: string; file: string }[];
+  apiCalls: { api: string; description: string; file: string; is_library?: boolean }[];
   pipelineStatus: {
     apktool: { success: boolean; message: string };
     jadx: { success: boolean; message: string };
@@ -48,10 +73,14 @@ type Report = {
   };
   verdict: "benign" | "suspicious" | "high-risk" | "malicious";
   confidence: number;
+  confidenceBreakdown?: string;
   executiveSummary?: string;
+  analystSummary?: string;
   recommendedActions?: string;
   mitreTechniques?: string[];
   agentFindings?: Record<string, AgentFinding>;
+  correlations?: Correlation[];
+  analysisScope?: "static_only" | "static_and_dynamic";
   package?: string;
 } | null;
 
@@ -105,25 +134,33 @@ const makeConversation = (title = "New analysis"): Conversation => ({
 
 // ---------- component ----------
 export function Home() {
-  const [conversations, setConversations] = useState<Conversation[]>([makeConversation("Untitled analysis")]);
-  const [activeId, setActiveId] = useState<string>("");
+  const [conversations, setConversations] = useState<Conversation[]>(() => {
+    // Try to restore from localStorage on first render
+    if (typeof window !== "undefined") {
+      try {
+        const saved = localStorage.getItem("argus_conversations");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && parsed.length > 0) return parsed;
+        }
+      } catch {}
+    }
+    return [makeConversation("Untitled analysis")];
+  });
+
+  const [activeId, setActiveId] = useState<string>(() => {
+    // Try to restore activeId from localStorage on first render
+    if (typeof window !== "undefined") {
+      const savedId = localStorage.getItem("argus_activeId");
+      if (savedId) return savedId;
+    }
+    return "";
+  });
+
   const [isMounted, setIsMounted] = useState(false);
 
   useEffect(() => {
     setIsMounted(true);
-    if (typeof window !== "undefined") {
-      const savedConvs = localStorage.getItem("argus_conversations");
-      if (savedConvs) {
-        try {
-          const parsed = JSON.parse(savedConvs);
-          if (parsed && parsed.length > 0) setConversations(parsed);
-        } catch (e) {}
-      }
-      const savedActiveId = localStorage.getItem("argus_activeId");
-      if (savedActiveId) {
-        setActiveId(savedActiveId);
-      }
-    }
   }, []);
 
   useEffect(() => {
@@ -268,10 +305,14 @@ export function Home() {
                   pipelineStatus,
                   verdict,
                   confidence,
+                  confidenceBreakdown: result.confidence_breakdown,
                   executiveSummary: result.executive_summary,
+                  analystSummary: result.analyst_summary,
                   recommendedActions: result.recommended_actions,
                   mitreTechniques: result.mitre_techniques,
                   agentFindings,
+                  correlations: result.correlations,
+                  analysisScope: result.analysis_scope,
                   package: result.package,
                 },
                 messages: [
@@ -716,6 +757,30 @@ function ActivityStream({
   );
 }
 
+function Badge({ label, variant }: { label: string; variant: "capability" | "observed" | "validated" | "not-validated" | "not-tested" | "high" | "medium" | "low" | "library" }) {
+  const colors: Record<string, string> = {
+    capability: "border-blue-500/30 bg-blue-500/10 text-blue-400",
+    observed: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+    validated: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+    "not-validated": "border-neutral-500/30 bg-neutral-500/10 text-neutral-400",
+    "not-tested": "border-neutral-600/30 bg-neutral-600/10 text-neutral-500",
+    high: "border-red-500/30 bg-red-500/10 text-red-400",
+    medium: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+    low: "border-neutral-500/30 bg-neutral-500/10 text-neutral-400",
+    library: "border-neutral-600/30 bg-neutral-600/10 text-neutral-500",
+  };
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${colors[variant] ?? colors["not-tested"]}`}>
+      {label}
+    </span>
+  );
+}
+
+function ConfidenceBadge({ level }: { level: string }) {
+  const v = level?.toUpperCase() === "HIGH" ? "high" : level?.toUpperCase() === "MEDIUM" ? "medium" : "low";
+  return <Badge label={level} variant={v as "high" | "medium" | "low"} />;
+}
+
 function ReportView({ report }: { report: NonNullable<Report> }) {
   const verdictColor =
     report.verdict === "malicious"
@@ -725,6 +790,16 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
         : report.verdict === "suspicious"
           ? "text-amber-400"
           : "text-emerald-400";
+
+  const appApis = report.apiCalls?.filter((a) => !a.is_library) ?? [];
+  const libApis = report.apiCalls?.filter((a) => a.is_library) ?? [];
+  const staticAgents = ["perm", "code", "network", "threat"];
+  const behaviorAgent = report.agentFindings?.behavior;
+  const correlations = report.correlations ?? [];
+  const validated = correlations.filter((c) => c.status === "VALIDATED");
+  const notValidated = correlations.filter((c) => c.status === "NOT_VALIDATED");
+  const notTested = correlations.filter((c) => c.status === "NOT_TESTED");
+
   return (
     <motion.article
       initial={{ opacity: 0, y: 6 }}
@@ -733,64 +808,246 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
       className="space-y-6 border-t border-white/[0.06] pt-8 text-[13px] leading-7 text-neutral-300"
     >
       <header className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-neutral-500">Report</div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] uppercase tracking-wider text-neutral-500">Report</span>
+          <Badge
+            label={report.analysisScope === "static_and_dynamic" ? "Static + Dynamic" : "Static Only"}
+            variant={report.analysisScope === "static_and_dynamic" ? "observed" : "capability"}
+          />
+        </div>
         <h2 className="text-[17px] font-medium text-neutral-100">{report.fileName}</h2>
       </header>
 
+      {/* Executive Summary */}
       <Section title="Executive Summary">
         {report.executiveSummary ? (
           <span>{report.executiveSummary}</span>
         ) : (
           <>
-            ARGUS performed a multi-agent static and behavioural review of <span className="text-neutral-100">{report.fileName}</span>.
-            Permission posture scored <span className="text-neutral-100">{report.permissionScore}%</span>, with{" "}
-            <span className="text-neutral-100">{report.highRisk.length}</span> high-risk capabilities surfaced. Consensus across the
-            six agents converged on a <span className={verdictColor}>{report.verdict}</span> verdict.
+            ARGUS performed {report.analysisScope === "static_and_dynamic" ? "static and dynamic" : "static"} analysis of{" "}
+            <span className="text-neutral-100">{report.fileName}</span>. Risk score:{" "}
+            <span className="text-neutral-100">{report.permissionScore}%</span> with{" "}
+            <span className="text-neutral-100">{report.highRisk.length}</span> high-risk capabilities.
           </>
         )}
       </Section>
 
+      {/* Verdict Stats */}
       <div className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-white/[0.06] bg-white/[0.04]">
         <Stat label="Risk Score" value={`${report.permissionScore}%`} />
         <Stat label="Confidence" value={`${report.confidence}%`} />
         <Stat label="Verdict" value={report.verdict} valueClass={verdictColor} />
       </div>
+      {report.confidenceBreakdown && (
+        <div className="rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2 font-mono text-[11px] text-neutral-500">
+          {report.confidenceBreakdown}
+        </div>
+      )}
 
-      <Section title="Threat Findings (Permissions)">
-        {report.highRisk.length === 0 ? (
-          <span className="text-neutral-500">No high-risk capabilities detected.</span>
-        ) : (
-          <ul className="space-y-1">
-            {report.highRisk.map((p) => (
-              <li key={p} className="flex items-start gap-2">
-                <ChevronRight size={12} className="mt-1.5 text-neutral-600" />
-                <span className="font-mono text-[12px] text-neutral-200">{p}</span>
-              </li>
-            ))}
-          </ul>
+      {/* ==================== STATIC ANALYSIS ==================== */}
+      <div className="rounded-lg border border-blue-500/10 bg-blue-500/[0.02] p-4">
+        <div className="mb-4 flex items-center gap-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-blue-400">Static Analysis</span>
+          <Badge label="Capabilities" variant="capability" />
+        </div>
+
+        <Section title="High-Risk Permissions">
+          {report.highRisk.length === 0 ? (
+            <span className="text-neutral-500">No high-risk permissions declared.</span>
+          ) : (
+            <ul className="space-y-1">
+              {report.highRisk.map((p) => (
+                <li key={p} className="flex items-center gap-2">
+                  <ChevronRight size={12} className="text-neutral-600" />
+                  <span className="font-mono text-[12px] text-neutral-200">{p}</span>
+                  <Badge label="capability" variant="capability" />
+                </li>
+              ))}
+            </ul>
+          )}
+        </Section>
+
+        <Section title={`API Capabilities — Application Code (${appApis.length})`}>
+          {!report.pipelineStatus?.jadx?.success ? (
+            <span className="text-amber-500">JADX skipped: {report.pipelineStatus?.jadx?.message}</span>
+          ) : appApis.length === 0 ? (
+            <span className="text-neutral-500">No suspicious APIs in application code.</span>
+          ) : (
+            <ul className="space-y-2">
+              {appApis.map((api, i) => (
+                <li key={i} className="flex items-start gap-2">
+                  <ChevronRight size={12} className="mt-1.5 text-neutral-600" />
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[12px] text-neutral-200">{api.api}</span>
+                      <Badge label="capability" variant="capability" />
+                    </div>
+                    <div className="text-[11px] text-neutral-500">{api.description} — {api.file}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Section>
+
+        {libApis.length > 0 && (
+          <Section title={`Library Findings (${libApis.length}) — Low Priority`}>
+            <ul className="space-y-1">
+              {libApis.slice(0, 5).map((api, i) => (
+                <li key={i} className="flex items-center gap-2 text-neutral-500">
+                  <ChevronRight size={12} className="text-neutral-700" />
+                  <span className="font-mono text-[11px]">{api.api}</span>
+                  <Badge label="library" variant="library" />
+                </li>
+              ))}
+              {libApis.length > 5 && <li className="text-[11px] text-neutral-600 pl-5">+{libApis.length - 5} more library findings omitted</li>}
+            </ul>
+          </Section>
         )}
-      </Section>
 
-      <Section title="Suspicious API Calls (Static Analysis)">
-        {!report.pipelineStatus?.jadx?.success ? (
-          <span className="text-amber-500">JADX static analysis skipped: {report.pipelineStatus?.jadx?.message}</span>
-        ) : report.apiCalls && report.apiCalls.length === 0 ? (
-          <span className="text-neutral-500">No suspicious API calls detected in the decompiled source.</span>
+        {/* Static agent findings */}
+        {staticAgents.map((agentId) => {
+          const agent = report.agentFindings?.[agentId];
+          if (!agent?.findings?.length) return null;
+          const agentName = agentId === "perm" ? "Permission" : agentId === "code" ? "Code" : agentId === "network" ? "Network" : "Threat Intel";
+          return (
+            <Section key={agentId} title={`${agentName} Agent Findings`}>
+              <ul className="space-y-2.5">
+                {agent.findings!.map((f, i) => (
+                  <li key={i} className="rounded-md border border-white/[0.04] bg-white/[0.02] px-3 py-2">
+                    <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                      <span className="font-mono text-[12px] text-neutral-200">{f.evidence}</span>
+                      <ConfidenceBadge level={f.confidence} />
+                      <Badge label={f.runtime_validation === "OBSERVED" ? "observed" : "not tested"} variant={f.runtime_validation === "OBSERVED" ? "observed" : "not-tested"} />
+                    </div>
+                    <div className="text-[11px] text-neutral-400">{f.interpretation}</div>
+                    {f.source_file && <div className="mt-0.5 text-[10px] text-neutral-600">Source: {f.source_file}</div>}
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          );
+        })}
+      </div>
+
+      {/* ==================== RUNTIME ANALYSIS ==================== */}
+      <div className={`rounded-lg border p-4 ${report.analysisScope === "static_and_dynamic" ? "border-emerald-500/10 bg-emerald-500/[0.02]" : "border-neutral-700/30 bg-neutral-800/20"}`}>
+        <div className="mb-4 flex items-center gap-2">
+          <span className={`text-[11px] font-semibold uppercase tracking-wider ${report.analysisScope === "static_and_dynamic" ? "text-emerald-400" : "text-neutral-500"}`}>
+            Runtime Analysis
+          </span>
+          {report.analysisScope === "static_and_dynamic"
+            ? <Badge label="Observations" variant="observed" />
+            : <Badge label="Not Performed" variant="not-tested" />
+          }
+        </div>
+
+        {report.analysisScope !== "static_and_dynamic" ? (
+          <div className="text-[12px] text-neutral-500">
+            Dynamic analysis was not performed. No emulator was available.
+            Runtime validation is required to confirm static capabilities.
+          </div>
+        ) : behaviorAgent ? (
+          <>
+            <div className="mb-3 grid grid-cols-3 gap-2 text-center">
+              <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-2 py-1.5">
+                <div className="text-[10px] text-neutral-500">Window</div>
+                <div className="text-[13px] font-medium text-neutral-200">{behaviorAgent.observation_window_seconds ?? "?"}s</div>
+              </div>
+              <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-2 py-1.5">
+                <div className="text-[10px] text-neutral-500">Hooks Triggered</div>
+                <div className="text-[13px] font-medium text-emerald-400">{behaviorAgent.hooks_triggered ?? 0}</div>
+              </div>
+              <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-2 py-1.5">
+                <div className="text-[10px] text-neutral-500">Hooks Silent</div>
+                <div className="text-[13px] font-medium text-neutral-400">{behaviorAgent.hooks_silent ?? 0}</div>
+              </div>
+            </div>
+
+            {behaviorAgent.observed_events && behaviorAgent.observed_events.length > 0 ? (
+              <ul className="space-y-2">
+                {behaviorAgent.observed_events.map((evt, i) => (
+                  <li key={i} className="rounded-md border border-white/[0.04] bg-white/[0.02] px-3 py-2">
+                    <div className="mb-1 flex items-center gap-1.5">
+                      <Badge label="observed" variant="observed" />
+                      <span className="font-mono text-[11px] text-neutral-400">{evt.event_type}</span>
+                      {evt.timestamp && <span className="text-[10px] text-neutral-600">{evt.timestamp}</span>}
+                    </div>
+                    <div className="font-mono text-[12px] text-neutral-200">{evt.evidence}</div>
+                    <div className="text-[11px] text-neutral-400">{evt.interpretation}</div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="text-[12px] text-neutral-500">
+                {behaviorAgent.summary || "No monitored behaviors triggered during the observation window."}
+              </div>
+            )}
+
+            {behaviorAgent.findings && behaviorAgent.findings.length > 0 && (
+              <Section title="Behavior Agent Findings">
+                <ul className="space-y-2">
+                  {behaviorAgent.findings.map((f, i) => (
+                    <li key={i} className="flex items-start gap-2">
+                      <ChevronRight size={12} className="mt-1.5 text-emerald-600" />
+                      <div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[12px] text-neutral-200">{f.evidence}</span>
+                          <Badge label="observed" variant="observed" />
+                          <ConfidenceBadge level={f.confidence} />
+                        </div>
+                        <div className="text-[11px] text-neutral-400">{f.interpretation}</div>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </Section>
+            )}
+          </>
         ) : (
-          <ul className="space-y-1">
-            {report.apiCalls?.map((api, i) => (
-              <li key={i} className="flex items-start gap-2">
-                <ChevronRight size={12} className="mt-1.5 text-neutral-600" />
-                <div>
-                  <div className="font-mono text-[12px] text-neutral-200">{api.api}</div>
-                  <div className="text-[11px] text-neutral-500">{api.description} (in {api.file})</div>
+          <div className="text-[12px] text-neutral-500">Behavior agent returned no findings.</div>
+        )}
+      </div>
+
+      {/* ==================== CORRELATION ANALYSIS ==================== */}
+      {correlations.length > 0 && (
+        <div className="rounded-lg border border-violet-500/10 bg-violet-500/[0.02] p-4">
+          <div className="mb-4 flex items-center gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-violet-400">Correlation Analysis</span>
+            <span className="text-[11px] text-neutral-500">
+              {validated.length} validated · {notValidated.length} not validated · {notTested.length} not tested
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {correlations.map((c, i) => {
+              const statusVariant = c.status === "VALIDATED" ? "validated" : c.status === "NOT_VALIDATED" ? "not-validated" : "not-tested";
+              const borderColor = c.status === "VALIDATED" ? "border-emerald-500/20" : c.status === "NOT_VALIDATED" ? "border-neutral-600/20" : "border-neutral-700/20";
+              return (
+                <div key={i} className={`rounded-md border ${borderColor} bg-white/[0.02] px-3 py-2`}>
+                  <div className="mb-1.5 flex items-center gap-2">
+                    <span className="text-[12px] font-medium text-neutral-200">{c.capability}</span>
+                    <Badge label={c.status.replace("_", " ")} variant={statusVariant} />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-[11px]">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-blue-400/60">Static</div>
+                      <div className="text-neutral-400">{c.static_evidence}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-emerald-400/60">Runtime</div>
+                      <div className="text-neutral-400">{c.dynamic_evidence}</div>
+                    </div>
+                  </div>
+                  <div className="mt-1 text-[10px] text-neutral-500">{c.risk_assessment}</div>
                 </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </Section>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
+      {/* ==================== PIPELINE & MITRE ==================== */}
       <Section title="Pipeline Status">
         <ul className="space-y-1 font-mono text-[12px]">
           <li>
@@ -836,8 +1093,22 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
               ? "Conduct dynamic analysis in a sandboxed environment to validate static findings. Do not deploy until runtime behavior is confirmed safe."
               : report.verdict === "suspicious"
                 ? "Hold the sample for manual review. Inspect the flagged permissions and APIs before promotion."
-                : "Sample is safe to release based on Phase 1 static analysis. Retain telemetry for baseline comparison."}
+                : "Sample is safe to release based on static analysis. Retain telemetry for baseline comparison."}
       </Section>
+
+      {report.analystSummary && (
+        <div className="rounded-lg border border-indigo-500/20 bg-indigo-500/[0.03] p-5">
+          <div className="mb-3 flex items-center gap-2">
+            <Hexagon size={14} className="text-indigo-400" />
+            <span className="text-[12px] font-semibold uppercase tracking-wider text-indigo-400">
+              Analyst Takeaways
+            </span>
+          </div>
+          <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-neutral-300">
+            {report.analystSummary}
+          </div>
+        </div>
+      )}
     </motion.article>
   );
 }
@@ -845,7 +1116,7 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   const [open, setOpen] = useState(true);
   return (
-    <section>
+    <section className="mb-3">
       <button
         onClick={() => setOpen((v) => !v)}
         className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-neutral-500 hover:text-neutral-300"
@@ -866,5 +1137,3 @@ function Stat({ label, value, valueClass = "text-neutral-100" }: { label: string
     </div>
   );
 }
-
-// answerFromReport removed — chat is now powered by the /chat API endpoint

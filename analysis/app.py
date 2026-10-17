@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import logging
 import json
+import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -67,87 +68,91 @@ HIGH_RISK_PERMISSIONS = {
 
 # ----------------------------------------------------------------
 # Patterns: API calls (string search in .java files)
+# Signal levels: HIGH = always send to LLM, MEDIUM = send but lower priority,
+#                LOW = counted but not individually listed to LLM
+# APIs that are normal Android behavior (startActivity, getIntent, Log.*,
+# System.out.println, registerReceiver, sendBroadcast) are NOT tracked at all.
 # ----------------------------------------------------------------
 SUSPICIOUS_API_PATTERNS = {
+    # --- HIGH SIGNAL: genuine threat indicators ---
     # Telephony / SMS
-    "SmsManager":                      "SMS Operations",
-    "sendTextMessage":                  "SMS Sending",
-    "getSubscriberId":                  "IMSI Extraction",
-    "getDeviceId":                      "IMEI/Device ID Extraction",
-    "getLine1Number":                   "Phone Number Extraction",
+    "SmsManager":                      ("SMS Operations", "HIGH"),
+    "sendTextMessage":                  ("SMS Sending", "HIGH"),
+    "getSubscriberId":                  ("IMSI Extraction", "HIGH"),
+    "getDeviceId":                      ("IMEI/Device ID Extraction", "HIGH"),
+    "getLine1Number":                   ("Phone Number Extraction", "HIGH"),
     # Command execution
-    "Runtime.getRuntime().exec":        "OS Command Execution",
-    "ProcessBuilder":                   "Process Spawning",
-    # Location
-    "getLastKnownLocation":             "Location Tracking",
-    "requestLocationUpdates":           "Continuous Location Tracking",
-    # Surveillance
-    "MediaRecorder":                    "Audio/Video Recording",
-    "Camera.open":                      "Camera Access",
-    # Dynamic code loading (DexClassLoader is high-signal; loadClass removed — too noisy)
-    "DexClassLoader":                   "Dynamic DEX Loading (HIGH)",
-    "PathClassLoader":                  "Dynamic Class Loading",
-    # Network
-    "HttpURLConnection":                "HTTP Network Connection",
-    "OkHttpClient":                     "HTTP Network Connection",
-    "URL(\"http://":                    "Cleartext HTTP URL",
-    # WebView
-    "setJavaScriptEnabled(true)":       "WebView JS Enabled",
-    "addJavascriptInterface":           "WebView JS Interface (XSS Risk)",
-    "loadUrl(\"http://":               "WebView Cleartext Load",
-    "setWebContentsDebuggingEnabled":   "WebView Remote Debugging Enabled",
-    # Crypto
-    "MD5":                              "Weak Hash: MD5",
-    "getInstance(\"MD5\")":             "Weak Hash: MD5",
-    "getInstance(\"SHA-1\")":           "Weak Hash: SHA-1",
-    "getInstance(\"DES\")":             "Weak Cipher: DES",
-    "getInstance(\"RC4\")":             "Weak Cipher: RC4",
-    "ECB":                              "Insecure Cipher Mode: ECB",
-    "NoPadding":                        "No Padding (potential ECB/insecure crypto)",
-    # Logging
-    "Log.d(":                           "Debug Logging",
-    "Log.i(":                           "Info Logging",
-    "Log.e(":                           "Error Logging",
-    "Log.v(":                           "Verbose Logging",
-    "System.out.println":               "Console Print (potential info leak)",
-    # Root detection / evasion
-    "su\"":                             "Root Check (su binary)",
-    "RootBeer":                         "Root Detection Library",
-    "isRooted":                         "Root Detection",
-    "detect_emulator":                  "Emulator Detection",
-    "Build.FINGERPRINT":                "Emulator/Device Fingerprint Check",
-    # Keystore / crypto storage
-    "SharedPreferences":                "SharedPreferences (potential plaintext storage)",
-    "getSharedPreferences":             "SharedPreferences Access",
-    # Reflection / obfuscation (only flagged in app code, filtered from libraries)
-    "java.lang.reflect":                "Java Reflection (obfuscation risk)",
-    "invoke(":                          "Reflective Method Invocation",
-    # File operations
-    "openFileOutput(":                  "File Write",
-    "getExternalStorageDirectory":      "External Storage Access",
-    # Clipboard
-    "ClipboardManager":                 "Clipboard Access",
-    # Accessibility
-    "AccessibilityService":             "Accessibility Service (spyware risk)",
-    "onAccessibilityEvent":             "Accessibility Event Hook",
+    "Runtime.getRuntime().exec":        ("OS Command Execution", "HIGH"),
+    "ProcessBuilder":                   ("Process Spawning", "HIGH"),
+    # Dynamic code loading
+    "DexClassLoader":                   ("Dynamic DEX Loading", "HIGH"),
+    # WebView injection
+    "addJavascriptInterface":           ("WebView JS Interface (XSS Risk)", "HIGH"),
+    "setWebContentsDebuggingEnabled":   ("WebView Remote Debugging Enabled", "HIGH"),
+    # Accessibility (spyware)
+    "AccessibilityService":             ("Accessibility Service (spyware risk)", "HIGH"),
+    "onAccessibilityEvent":             ("Accessibility Event Hook", "HIGH"),
     # Device admin
-    "DevicePolicyManager":              "Device Admin API",
-    "lockNow":                          "Device Lock Call",
-    # Intent / Broadcast (sniffing & injection risk)
-    "registerReceiver":                 "Dynamic BroadcastReceiver Registration",
-    "sendBroadcast":                    "Broadcast Intent Sending",
-    "sendOrderedBroadcast":             "Ordered Broadcast Sending",
-    "startActivity(":                   "Activity Launch (potential Intent injection)",
-    "getIntent(":                       "Intent Data Read",
+    "DevicePolicyManager":              ("Device Admin API", "HIGH"),
+    "lockNow":                          ("Device Lock Call", "HIGH"),
+    # Surveillance
+    "MediaRecorder":                    ("Audio/Video Recording", "HIGH"),
+    "Camera.open":                      ("Camera Access", "HIGH"),
+    # Location
+    "getLastKnownLocation":             ("Location Tracking", "HIGH"),
+    "requestLocationUpdates":           ("Continuous Location Tracking", "HIGH"),
+    # Clipboard
+    "ClipboardManager":                 ("Clipboard Access", "HIGH"),
+
+    # --- MEDIUM SIGNAL: worth sending, context-dependent ---
+    # Crypto weaknesses
+    "getInstance(\"MD5\")":             ("Weak Hash: MD5", "MEDIUM"),
+    "getInstance(\"SHA-1\")":           ("Weak Hash: SHA-1", "MEDIUM"),
+    "getInstance(\"DES\")":             ("Weak Cipher: DES", "MEDIUM"),
+    "getInstance(\"RC4\")":             ("Weak Cipher: RC4", "MEDIUM"),
+    "ECB":                              ("Insecure Cipher Mode: ECB", "MEDIUM"),
+    "NoPadding":                        ("No Padding (insecure crypto)", "MEDIUM"),
+    # WebView
+    "setJavaScriptEnabled(true)":       ("WebView JS Enabled", "MEDIUM"),
+    "loadUrl(\"http://":               ("WebView Cleartext Load", "MEDIUM"),
+    # Root/emulator detection (evasion indicators)
+    "su\"":                             ("Root Check (su binary)", "MEDIUM"),
+    "RootBeer":                         ("Root Detection Library", "MEDIUM"),
+    "isRooted":                         ("Root Detection", "MEDIUM"),
+    "detect_emulator":                  ("Emulator Detection", "MEDIUM"),
+    "Build.FINGERPRINT":                ("Emulator/Device Fingerprint Check", "MEDIUM"),
+    # Dynamic class loading (lower than DexClassLoader)
+    "PathClassLoader":                  ("Dynamic Class Loading", "MEDIUM"),
+    # File operations
+    "openFileOutput(":                  ("File Write", "MEDIUM"),
+    "getExternalStorageDirectory":      ("External Storage Access", "MEDIUM"),
+    # Cleartext network
+    "URL(\"http://":                    ("Cleartext HTTP URL", "MEDIUM"),
+
+    # --- LOW SIGNAL: counted only, not individually listed to LLM ---
+    # These are ubiquitous in legitimate apps and only matter in aggregate
+    "HttpURLConnection":                ("HTTP Network Connection", "LOW"),
+    "OkHttpClient":                     ("HTTP Network Connection", "LOW"),
+    "SharedPreferences":                ("SharedPreferences Usage", "LOW"),
+    "getSharedPreferences":             ("SharedPreferences Access", "LOW"),
+    "java.lang.reflect":                ("Java Reflection", "LOW"),
+    "invoke(":                          ("Reflective Method Invocation", "LOW"),
 }
 
 # Patterns that should be SUPPRESSED when found inside standard library paths
-# (android.support.*, com.google.*, androidx.*)
-LIBRARY_NOISE_PATTERNS = {"java.lang.reflect", "invoke("}
+LIBRARY_NOISE_PATTERNS = {
+    "java.lang.reflect", "invoke(",
+    "SharedPreferences", "getSharedPreferences",
+    "HttpURLConnection", "OkHttpClient",
+    "URL(\"http://",
+}
 LIBRARY_PATH_PREFIXES = (
     "android/support/", "androidx/", "com/google/",
     "com/squareup/", "okhttp3/", "okio/",
     "org/apache/", "kotlin/", "kotlinx/",
+    "com/bumptech/", "retrofit2/", "dagger/",
+    "io/reactivex/", "com/fasterxml/", "bolts/",
+    "com/facebook/", "org/intellij/", "org/jetbrains/",
 )
 
 from pathlib import Path
@@ -207,7 +212,8 @@ def run_jadx(apk_path, out_dir):
 
 def extract_api_calls_from_source(source_dir):
     """Scan decompiled Java source for suspicious API usage.
-    Filters out reflection/invoke hits from standard library paths to reduce noise."""
+    Filters out noisy patterns from standard library paths.
+    Tags each finding with is_library and signal_level (HIGH/MEDIUM/LOW)."""
     found_apis = []
     if not os.path.exists(source_dir):
         return found_apis
@@ -224,7 +230,7 @@ def extract_api_calls_from_source(source_dir):
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
                     content = fp.read()
-                    for pattern, desc in SUSPICIOUS_API_PATTERNS.items():
+                    for pattern, (desc, signal_level) in SUSPICIOUS_API_PATTERNS.items():
                         # Skip noisy patterns when inside library code
                         if is_library and pattern in LIBRARY_NOISE_PATTERNS:
                             continue
@@ -232,7 +238,13 @@ def extract_api_calls_from_source(source_dir):
                             key = (pattern, f)
                             if key not in seen:
                                 seen.add(key)
-                                found_apis.append({"api": pattern, "description": desc, "file": f})
+                                found_apis.append({
+                                    "api": pattern,
+                                    "description": desc,
+                                    "file": f,
+                                    "is_library": is_library,
+                                    "signal": signal_level,
+                                })
             except Exception:
                 pass
     return found_apis
@@ -389,12 +401,18 @@ def analyze_manifest_vulnerabilities(apk):
 
 
 def collect_code_snippets(source_dir, api_calls, max_snippets=10, context_lines=5):
-    """Collect short code snippets around suspicious API calls for LLM context."""
+    """Collect short code snippets around suspicious API calls for LLM context.
+    Only collects snippets for app code (not libraries) and HIGH/MEDIUM signal APIs."""
     snippets = []
     if not os.path.exists(source_dir) or not api_calls:
         return snippets
+    # Only target app code (not libraries) and HIGH/MEDIUM signal (not LOW noise)
+    eligible = [
+        a for a in api_calls
+        if not a.get('is_library', False) and a.get('signal', 'HIGH') != 'LOW'
+    ]
     # Build a set of (api_pattern, filename) pairs to find
-    targets = {(a['api'], a['file']) for a in api_calls[:max_snippets]}
+    targets = {(a['api'], a['file']) for a in eligible[:max_snippets]}
     for root, _, files in os.walk(source_dir):
         for fname in files:
             if not fname.endswith('.java'):
@@ -423,205 +441,856 @@ def collect_code_snippets(source_dir, api_calls, max_snippets=10, context_lines=
                 pass
     return snippets[:max_snippets]
 
-# ---------- LLM Analysis Functions ----------
+# ---------- Evidence Pipeline (Phase 1) ----------
 
-def run_llm_analysis(package_name, permissions, high_risk, api_calls, code_snippets,
-                     manifest_snippet="", dynamic_logs=None, manifest_vulns=None, hardcoded_secrets=None):
-    """Run a batched 6-agent analysis via DeepSeek. Returns per-agent findings."""
-    if not llm_client:
-        return None
+def parse_frida_logs(raw_logs):
+    """Parse raw Frida log strings into structured typed events.
+    This makes dynamic evidence machine-readable instead of dumping raw strings."""
+    if not raw_logs:
+        return []
 
-    manifest_vulns = manifest_vulns or []
-    hardcoded_secrets = hardcoded_secrets or []
+    EVENT_PATTERNS = [
+        (re.compile(r'Command Execution: Runtime\.exec\((.+)\)'), 'command_execution'),
+        (re.compile(r'SMS Manager: Sending SMS to (.+)'), 'sms'),
+        (re.compile(r'Crypto API: (.+)'), 'crypto'),
+        (re.compile(r'Network Connection: Opening URL -> (.+)'), 'network'),
+        (re.compile(r'Obfuscation/Data: Base64 decode (.+)'), 'base64'),
+        (re.compile(r'File Access: new File\("(.+)"\)'), 'file_access'),
+    ]
 
-    # Build the data context for the LLM
-    data_context = f"""## APK Analysis Data
+    parsed = []
+    for log_line in raw_logs:
+        if not isinstance(log_line, str):
+            continue
 
-**Package**: {package_name}
+        # Extract timestamp if present: [2026-06-11T...] rest
+        timestamp = ""
+        detail = log_line
+        ts_match = re.match(r'\[([^\]]+)\]\s*(.*)', log_line)
+        if ts_match:
+            timestamp = ts_match.group(1)
+            detail = ts_match.group(2)
 
-**All Permissions** ({len(permissions)}):
-{chr(10).join(f'- {p}' for p in permissions)}
+        event_type = "unknown"
+        for pattern, etype in EVENT_PATTERNS:
+            if pattern.search(detail):
+                event_type = etype
+                break
 
-**High-Risk Permissions** ({len(high_risk)}):
+        # Skip Frida system messages (hook injection confirmations, errors about hooking)
+        if detail.startswith("Frida hooks injected") or detail.startswith("Failed to hook"):
+            continue
+        if detail.startswith("Waiting for Java VM"):
+            continue
+
+        parsed.append({
+            "event_type": event_type,
+            "timestamp": timestamp,
+            "detail": detail,
+            "raw": log_line,
+        })
+
+    return parsed
+
+
+def build_static_evidence(package_name, permissions, high_risk, api_calls,
+                          code_snippets, manifest_snippet, manifest_vulns,
+                          hardcoded_secrets):
+    """Build the static-only evidence bundle. No runtime claims allowed.
+    This is what static agents (Permission, Code, Network, Threat Intel) receive.
+    
+    Only HIGH and MEDIUM signal findings are individually listed.
+    LOW signal findings are collapsed into a count to avoid LLM noise."""
+
+    # Separate app-code findings from library findings
+    app_apis = [a for a in api_calls if not a.get('is_library', False)]
+    lib_apis = [a for a in api_calls if a.get('is_library', False)]
+
+    # Split app APIs by signal level
+    high_apis = [a for a in app_apis if a.get('signal') == 'HIGH']
+    medium_apis = [a for a in app_apis if a.get('signal') == 'MEDIUM']
+    low_apis = [a for a in app_apis if a.get('signal') == 'LOW']
+
+    evidence = f"""## Static Analysis Evidence — {package_name}
+
+**EVIDENCE TYPE**: Static analysis only. This application has NOT been executed.
+All findings represent CODE CAPABILITIES, not observed behavior.
+
+### Permissions ({len(permissions)} total, {len(high_risk)} high-risk)
+{chr(10).join(f'- {p}' for p in permissions) if permissions else '- None declared'}
+
+### High-Risk Permissions
 {chr(10).join(f'- {p}' for p in high_risk) if high_risk else '- None'}
 
-**Suspicious API Calls** ({len(api_calls)}):
-{chr(10).join(f'- {a["api"]} ({a["description"]}) in {a["file"]}' for a in api_calls) if api_calls else '- None detected'}
+### HIGH Signal API Findings ({len(high_apis)} found)
+{chr(10).join(f'- [{a["description"]}] {a["api"]} in {a["file"]}' for a in high_apis) if high_apis else '- None'}
 
-**Manifest Vulnerabilities** ({len(manifest_vulns)} found):
-{chr(10).join(f'- [{v["severity"]}] {v["title"]}: {v["detail"]}' for v in manifest_vulns) if manifest_vulns else '- None detected'}
+### MEDIUM Signal API Findings ({len(medium_apis)} found)
+{chr(10).join(f'- [{a["description"]}] {a["api"]} in {a["file"]}' for a in medium_apis) if medium_apis else '- None'}
 
-**Hardcoded Secrets / Backdoor Patterns** ({len(hardcoded_secrets)} found):
-{chr(10).join(f'- {s["type"]} in {s["file"]} (line {s["line"]}): {s["snippet"]}' for s in hardcoded_secrets) if hardcoded_secrets else '- None detected'}
+### Low Signal (not individually listed): {len(low_apis)} findings (e.g. SharedPreferences, HttpURLConnection, Reflection — common in legitimate apps)
+### Library Code: {len(lib_apis)} findings (de-prioritized — from standard libraries)
+
+### Manifest Vulnerabilities ({len(manifest_vulns or [])} found)
+{chr(10).join(f'- [{v["severity"]}] {v["title"]}: {v["detail"]}' for v in (manifest_vulns or [])) if manifest_vulns else '- None detected'}
+
+### Hardcoded Secrets / Backdoor Patterns ({len(hardcoded_secrets or [])} found)
+{chr(10).join(f'- {s["type"]} in {s["file"]} (line {s["line"]}): {s["snippet"]}' for s in (hardcoded_secrets or [])) if hardcoded_secrets else '- None detected'}
 """
 
     if code_snippets:
-        data_context += "\n**Code Snippets Around Suspicious Calls**:\n"
-        for s in code_snippets:
-            data_context += f"\n--- {s['file']} (line {s['line']}, API: {s['api']}) ---\n```java\n{s['code']}\n```\n"
+        # Only include snippets for HIGH/MEDIUM signal APIs
+        high_medium_patterns = {a['api'] for a in high_apis + medium_apis}
+        relevant_snippets = [s for s in code_snippets if s['api'] in high_medium_patterns]
+        if relevant_snippets:
+            evidence += "\n### Code Snippets (context around high/medium signal API calls)\n"
+            for s in relevant_snippets:
+                evidence += f"\n--- {s['file']} (line {s['line']}, API: {s['api']}) ---\n```java\n{s['code']}\n```\n"
 
     if manifest_snippet:
-        data_context += f"\n**AndroidManifest.xml (excerpt)**:\n```xml\n{manifest_snippet}\n```\n"
+        evidence += f"\n### AndroidManifest.xml (excerpt)\n```xml\n{manifest_snippet}\n```\n"
 
-    if dynamic_logs:
-        data_context += "\n**Dynamic Analysis Logs (Frida Intercepts at Runtime)**:\n"
-        if len(dynamic_logs) > 0:
-            for log in dynamic_logs[:20]: # Cap to 20 lines to save tokens
-                data_context += f"- {log}\n"
-        else:
-            data_context += "- App was executed, but no suspicious behavior was intercepted by the hooks.\n"
+    return evidence
+
+
+def build_dynamic_evidence(dynamic_logs, sandbox_status, duration_seconds=10):
+    """Build the runtime-only evidence bundle. No static findings included.
+    This is what the Behavior Agent receives."""
+
+    parsed_events = parse_frida_logs(dynamic_logs) if dynamic_logs else []
+
+    if not sandbox_status or not sandbox_status.get('success', False):
+        return None, parsed_events  # No dynamic analysis performed
+
+    # Group events by type
+    event_groups = {}
+    for evt in parsed_events:
+        etype = evt['event_type']
+        if etype not in event_groups:
+            event_groups[etype] = []
+        event_groups[etype].append(evt)
+
+    evidence = f"""## Runtime Analysis Evidence
+
+**EVIDENCE TYPE**: Dynamic runtime observations from sandbox execution.
+**Observation Window**: {duration_seconds} seconds
+**Total Events Captured**: {len(parsed_events)}
+**Hooks Status**: Frida hooks were active for: Runtime.exec, SmsManager, Cipher, Base64.decode, URL creation, File access
+
+"""
+
+    if not parsed_events:
+        evidence += """### No Runtime Activity Observed
+The application was executed in the sandbox with Frida hooks active.
+No monitored behaviors were triggered during the observation window.
+This means the hooks did NOT intercept any calls — it does NOT mean the app lacks these capabilities.
+"""
     else:
-        data_context += "\n**Dynamic Analysis Logs**: (Not performed - no sandbox available)\n"
+        for etype, events in event_groups.items():
+            evidence += f"### {etype.replace('_', ' ').title()} ({len(events)} events)\n"
+            for evt in events[:10]:  # Cap per category
+                evidence += f"- [{evt['timestamp']}] {evt['detail']}\n"
+            if len(events) > 10:
+                evidence += f"  (... {len(events) - 10} more events omitted)\n"
+            evidence += "\n"
 
-    system_prompt = """You are ARGUS, an expert Android malware analysis system composed of 6 specialized agents.
-Analyze the provided APK data and respond as each agent with specific, evidence-based findings.
+    return evidence, parsed_events
 
-CRITICAL ANALYSIS CONSTRAINTS:
-- This is STATIC ANALYSIS ONLY. No dynamic/runtime analysis was performed.
-- You can prove CAPABILITY (the code exists) but NOT OBSERVED BEHAVIOR (it actually runs).
-- Distinguish between "the app CAN send SMS" vs "the app DOES send SMS" — always use the former.
-- Findings in standard library code (android.support.*, com.google.*, androidx.*) are LOWER priority than app-specific code.
-- If a vulnerability is a manifest misconfiguration (debuggable, allowBackup, exported components), state it as a configuration vulnerability, not proof of malicious intent.
-- Consider that the app might be a deliberately vulnerable test/training application if the package name suggests it.
+
+# ---------- LLM Analysis Functions ----------
+
+def log_llm_prompt(agent_name, messages):
+    try:
+        in_dir = PROJECT_ROOT / 'in'
+        in_dir.mkdir(parents=True, exist_ok=True)
+        log_file = in_dir / 'prompts_log.txt'
+        timestamp = datetime.datetime.now().isoformat()
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"TIMESTAMP: {timestamp}\n")
+            f.write(f"AGENT: {agent_name}\n")
+            f.write(f"{'-'*80}\n")
+            for m in messages:
+                f.write(f"ROLE: {m.get('role', 'unknown')}\n")
+                f.write(f"CONTENT:\n{m.get('content', '')}\n")
+                f.write(f"{'-'*40}\n")
+    except Exception as e:
+        print(f"[ERROR] Failed to log prompt: {e}")
+
+def _repair_truncated_json(raw):
+    """Attempt to repair truncated JSON from an LLM that ran out of tokens.
+    Closes unclosed strings, arrays, and objects."""
+    # If the string ends mid-value, try to close it
+    # Remove any trailing incomplete key-value pair
+    # Work backwards to find the last complete value
+    
+    # Strategy: find the last valid comma or complete value,
+    # then close all open brackets/braces
+    
+    # First, try to close any open string
+    quote_count = 0
+    in_string = False
+    escape_next = False
+    for ch in raw:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\':
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            quote_count += 1
+    
+    if in_string:
+        # We're inside an unclosed string — close it
+        raw = raw.rstrip()
+        # Remove any trailing incomplete escape
+        if raw.endswith('\\'):
+            raw = raw[:-1]
+        raw += '"'
+    
+    # Now try to find the last position where we can cut and close brackets
+    # Remove trailing comma if present
+    raw = raw.rstrip()
+    if raw.endswith(','):
+        raw = raw[:-1]
+    
+    # Track open brackets/braces
+    stack = []
+    in_str = False
+    esc = False
+    for ch in raw:
+        if esc:
+            esc = False
+            continue
+        if ch == '\\' and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch == '}':
+            if stack and stack[-1] == '{':
+                stack.pop()
+        elif ch == ']':
+            if stack and stack[-1] == '[':
+                stack.pop()
+    
+    # Close all unclosed brackets/braces in reverse order
+    for opener in reversed(stack):
+        if opener == '{':
+            raw += '}'
+        elif opener == '[':
+            raw += ']'
+    
+    return raw
+
+
+def _parse_llm_json(raw):
+    """Parse JSON from LLM response, handling common issues:
+    - Empty responses
+    - Markdown fences (```json ... ```)
+    - Preamble text before the JSON
+    - Trailing text after the JSON
+    - Truncated responses (DeepSeek flash running out of tokens)
+    """
+    if not raw or not raw.strip():
+        raise json.JSONDecodeError("Empty LLM response", "", 0)
+
+    raw = raw.strip()
+
+    # Strip markdown fences: ```json ... ``` or ``` ... ```
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+            if cleaned.startswith("{"):
+                raw = cleaned
+                break
+
+    # If raw still doesn't start with {, try to find JSON object in the text
+    if not raw.startswith("{"):
+        first_brace = raw.find("{")
+        last_brace = raw.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            raw = raw[first_brace:last_brace + 1]
+        elif first_brace != -1:
+            # Has opening brace but no closing — truncated response
+            raw = raw[first_brace:]
+        else:
+            raise json.JSONDecodeError(
+                f"No JSON object found in LLM response (first 200 chars): {raw[:200]}", raw, 0
+            )
+
+    # Attempt 1: direct parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: repair truncated JSON
+    try:
+        repaired = _repair_truncated_json(raw)
+        print(f"[LLM] Attempting truncated JSON repair ({len(raw)} -> {len(repaired)} chars)", flush=True)
+        result = json.loads(repaired)
+        print(f"[LLM] JSON repair successful — recovered partial data", flush=True)
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: progressively trim from the end to find a parseable subset
+    # Find the last complete property by looking for the last "}," or "],"
+    for trim_marker in ['},', '],', '"}\n', '"]\n']:
+        last_pos = raw.rfind(trim_marker)
+        if last_pos > 0:
+            candidate = raw[:last_pos + len(trim_marker) - 1]  # include } or ] but not ,
+            try:
+                repaired = _repair_truncated_json(candidate)
+                result = json.loads(repaired)
+                print(f"[LLM] JSON recovery via trimming at char {last_pos} — partial data recovered", flush=True)
+                return result
+            except json.JSONDecodeError:
+                continue
+
+    # All repair attempts failed
+    raise json.JSONDecodeError(
+        f"JSON parse failed after repair attempts (first 300 chars): {raw[:300]}", raw, 0
+    )
+
+
+FORBIDDEN_PHRASES = [
+    "may ", "might ", "could ", "potentially", "likely ", "possibly",
+    "suggests that", "indicates that", "appears to", "seems to",
+    "aligns with", "consistent with malware", "characteristic of",
+    "typical of malware", "commonly used by threat actors",
+    "exfiltrate", "command and control", "privilege escalation",
+    "data theft", "data exfiltration", "c2 communication",
+    "c&c server", "phone home",
+]
+
+
+def enforce_language_rules(text):
+    """Post-process LLM output to strip speculative/forbidden phrases.
+    Replaces them with evidence-based alternatives where possible."""
+    if not isinstance(text, str):
+        return text
+
+    replacements = {
+        "may ": "",
+        "might ": "",
+        "could ": "",
+        "potentially": "",
+        "likely ": "",
+        "possibly": "",
+        "suggests that": "evidence shows that",
+        "indicates that": "shows that",
+        "appears to": "",
+        "seems to": "",
+        "aligns with": "matches pattern of",
+        "consistent with malware": "matching known threat patterns",
+        "characteristic of": "matching",
+        "typical of malware": "seen in threat samples",
+    }
+
+    result = text
+    for phrase, replacement in replacements.items():
+        result = result.replace(phrase, replacement)
+        result = result.replace(phrase.capitalize(), replacement.capitalize() if replacement else "")
+
+    # Clean up double spaces from removals
+    while "  " in result:
+        result = result.replace("  ", " ")
+
+    return result.strip()
+
+
+def enforce_language_on_findings(findings_dict):
+    """Apply language enforcement to all string values in agent findings."""
+    if not isinstance(findings_dict, dict):
+        return findings_dict
+    cleaned = {}
+    for key, value in findings_dict.items():
+        if isinstance(value, dict):
+            cleaned[key] = enforce_language_on_findings(value)
+        elif isinstance(value, str):
+            cleaned[key] = enforce_language_rules(value)
+        elif isinstance(value, list):
+            cleaned[key] = [
+                enforce_language_on_findings(item) if isinstance(item, dict)
+                else enforce_language_rules(item) if isinstance(item, str)
+                else item
+                for item in value
+            ]
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def run_static_agents(package_name, permissions, high_risk, api_calls, code_snippets,
+                      manifest_snippet="", manifest_vulns=None, hardcoded_secrets=None):
+    """Run static analysis agents: Permission, Code, Network, Threat Intel.
+    These agents receive ONLY static evidence — no runtime data."""
+    if not llm_client:
+        return None
+
+    # Build the static-only evidence bundle
+    static_evidence = build_static_evidence(
+        package_name, permissions, high_risk, api_calls,
+        code_snippets, manifest_snippet, manifest_vulns, hardcoded_secrets
+    )
+
+    system_prompt = """You are ARGUS, an Android security analysis system with 4 specialized static analysis agents.
+You are analyzing STATIC evidence ONLY. This application has NOT been executed.
+
+ABSOLUTE RULES — VIOLATION OF THESE RULES IS UNACCEPTABLE:
+1. Every finding MUST use "capability detected" / "code exists for" / "permission declared"
+   NEVER use "performs" / "executes" / "sends" / "connects" / "exfiltrates"
+2. FORBIDDEN phrases (do NOT use under any circumstances):
+   may, might, could, potentially, likely, possibly, suggests that, indicates that,
+   appears to, seems to, aligns with, consistent with malware, characteristic of,
+   typical of malware, exfiltrate, command and control, privilege escalation, data theft
+3. Findings tagged [LIBRARY] are from standard libraries (androidx, com.google, etc.)
+   — mark them LOW confidence and do NOT treat them as application-specific behavior
+4. Every claim MUST cite the source file name
+5. Do NOT infer intent from capability. "SmsManager in code" means "SMS capability exists"
+   — it does NOT mean "app sends SMS" or "app is spyware"
+6. Manifest misconfigurations (debuggable, allowBackup) are CONFIGURATION VULNERABILITIES,
+   not evidence of malicious intent
+
+CONFIDENCE SCORING (use for each finding):
+- HIGH: Direct code evidence with clear malicious context (e.g., hardcoded backdoor credential,
+  obfuscated C2 URL, plaintext password in login function)
+- MEDIUM: Code evidence exists but context is ambiguous or could be legitimate
+  (e.g., Runtime.exec with variable argument, DexClassLoader for plugin system)
+- LOW: Pattern exists but is extremely common in legitimate apps
+  (e.g., SharedPreferences, HttpURLConnection, Log.d)
 
 You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
 {
   "perm": {
-    "summary": "one-line summary for the Permission Agent",
-    "detail": "2-3 sentence analysis of the permission landscape and risks"
+    "findings": [
+      {
+        "evidence": "exact permission string or API",
+        "source_file": "filename where found",
+        "interpretation": "factual capability statement — no speculation",
+        "confidence": "HIGH|MEDIUM|LOW",
+        "runtime_validation": "NOT_TESTED"
+      }
+    ],
+    "summary": "one-line factual summary"
   },
   "code": {
-    "summary": "one-line summary for the Code Agent",
-    "detail": "2-3 sentence analysis of suspicious code patterns and API usage"
-  },
-  "behavior": {
-    "summary": "one-line summary for the Behavior Agent",
-    "detail": "2-3 sentence analysis of POTENTIAL behavioral patterns inferred from static code. Use phrases like 'capable of' or 'code exists to' rather than asserting observed behavior."
+    "findings": [
+      {
+        "evidence": "exact API or code pattern",
+        "source_file": "filename",
+        "interpretation": "what this code is capable of — stated as capability, not behavior",
+        "confidence": "HIGH|MEDIUM|LOW",
+        "runtime_validation": "NOT_TESTED"
+      }
+    ],
+    "summary": "one-line factual summary"
   },
   "network": {
-    "summary": "one-line summary for the Network Agent",
-    "detail": "2-3 sentence analysis of network-related capabilities and risks"
+    "findings": [
+      {
+        "evidence": "network-related API or URL",
+        "source_file": "filename",
+        "interpretation": "network capability description",
+        "confidence": "HIGH|MEDIUM|LOW",
+        "runtime_validation": "NOT_TESTED"
+      }
+    ],
+    "summary": "one-line factual summary"
   },
   "threat": {
-    "summary": "one-line summary for the Threat Intelligence Agent",
-    "detail": "2-3 sentence analysis correlating findings with known threat patterns/MITRE ATT&CK"
-  },
-  "consensus": {
-    "summary": "one-line summary for the Consensus Agent (e.g. 'Verdict: suspicious')",
-    "detail": "2-3 sentence final synthesis that explicitly states what can and cannot be concluded from static analysis alone."
+    "findings": [
+      {
+        "evidence": "specific finding that maps to a threat pattern",
+        "mitre_technique": "T1234 or N/A",
+        "interpretation": "how this maps to the technique — capability only, not observed",
+        "confidence": "HIGH|MEDIUM|LOW"
+      }
+    ],
+    "summary": "one-line factual summary"
   }
 }
 
-Be specific and reference actual findings from the data. Do not make up capabilities not evidenced in the data."""
+Limit to the top 3 most significant findings per agent. Prioritize application code over library code.
+Keep each "interpretation" field under 15 words."""
+
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[LLM] Sending static agents request (attempt {attempt}/{max_attempts})...", flush=True)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": static_evidence},
+            ]
+            if attempt == 1:
+                log_llm_prompt("Static Agents", messages)
+            response = llm_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=messages,
+                temperature=0.2 + (attempt - 1) * 0.1,  # slightly higher temp on retry
+                max_tokens=4096,
+            )
+            raw = response.choices[0].message.content.strip()
+            print(f"[LLM] Static agents received ({len(raw)} chars)", flush=True)
+
+            findings = _parse_llm_json(raw)
+            findings = enforce_language_on_findings(findings)
+            return findings
+        except json.JSONDecodeError as e:
+            print(f"[LLM] Static agents JSON parse error (attempt {attempt}): {e}\nRaw: {raw[:500]}", flush=True)
+            if attempt == max_attempts:
+                return None
+        except Exception as e:
+            print(f"[LLM] Static agents error (attempt {attempt}): {type(e).__name__}: {e}", flush=True)
+            if attempt == max_attempts:
+                return None
+
+
+def run_behavior_agent(dynamic_logs, sandbox_status, duration_seconds=10):
+    """Run the Behavior Agent with ONLY dynamic/runtime evidence.
+    This agent has NO access to static findings — it analyzes what was OBSERVED."""
+    if not llm_client:
+        return None
+
+    dynamic_evidence, parsed_events = build_dynamic_evidence(
+        dynamic_logs, sandbox_status, duration_seconds
+    )
+
+    # If no dynamic analysis was performed, return a structured "not performed" result
+    if dynamic_evidence is None:
+        return {
+            "behavior": {
+                "observed_events": [],
+                "observation_window_seconds": 0,
+                "hooks_triggered": 0,
+                "hooks_silent": 6,
+                "summary": "Dynamic analysis was not performed. No emulator was available.",
+                "findings": []
+            }
+        }
+
+    system_prompt = """You are the ARGUS Behavior Agent. You analyze ONLY runtime observations.
+
+YOUR EVIDENCE: Frida hook intercepts that captured ACTUAL function calls during sandbox execution.
+These are OBSERVED behaviors — things that actually happened when the app ran.
+
+ABSOLUTE RULES — VIOLATION OF THESE RULES IS UNACCEPTABLE:
+1. You MUST ONLY discuss what was OBSERVED at runtime (Frida hook intercepts)
+2. You have NO access to static analysis. Do NOT reference source code, permissions, or manifest.
+3. If a Frida hook triggered, report it as OBSERVED FACT: "Runtime.exec('su') was called"
+4. If zero hooks triggered, your entire report is:
+   "Application was executed for N seconds. No monitored behaviors were triggered."
+5. "No SMS observed" does NOT mean "App does not send SMS" — it means
+   "No SMS activity was captured during the observation window"
+6. FORBIDDEN: inferring capability from non-observation, referencing static analysis,
+   using words: may, might, could, potentially, likely, possibly
+
+CONFIDENCE for runtime findings is always HIGH — you saw it happen.
+
+You MUST respond with valid JSON only (no markdown fences, no extra text):
+{
+  "behavior": {
+    "observed_events": [
+      {
+        "event_type": "command_execution|network|crypto|sms|file_access|base64",
+        "evidence": "exact Frida log entry showing what was observed",
+        "timestamp": "when it was observed",
+        "interpretation": "factual description of what happened — this is OBSERVED, not inferred"
+      }
+    ],
+    "observation_window_seconds": N,
+    "hooks_triggered": N,
+    "hooks_silent": N,
+    "summary": "one-line factual summary of what was observed at runtime",
+    "findings": [
+      {
+        "evidence": "specific runtime observation",
+        "source_file": "runtime",
+        "interpretation": "what was observed",
+        "confidence": "HIGH",
+        "runtime_validation": "OBSERVED"
+      }
+    ]
+  }
+}"""
 
     try:
-        print("[LLM] Sending 6-agent analysis request...", flush=True)
+        print("[LLM] Sending behavior agent request (dynamic only)...", flush=True)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": dynamic_evidence},
+        ]
+        log_llm_prompt("Behavior Agent", messages)
         response = llm_client.chat.completions.create(
             model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": data_context},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=1500,
         )
         raw = response.choices[0].message.content.strip()
-        print(f"[LLM] Agent analysis received ({len(raw)} chars)", flush=True)
+        print(f"[LLM] Behavior agent received ({len(raw)} chars)", flush=True)
 
-        # Try to parse JSON (handle markdown fences if present)
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        agent_findings = json.loads(raw)
-        return agent_findings
+        findings = _parse_llm_json(raw)
+        findings = enforce_language_on_findings(findings)
+        return findings
     except json.JSONDecodeError as e:
-        print(f"[LLM] JSON parse error: {e}\nRaw response: {raw[:500]}", flush=True)
+        print(f"[LLM] Behavior agent JSON parse error: {e}\nRaw: {raw[:500]}", flush=True)
         return None
     except Exception as e:
-        print(f"[LLM] Agent analysis error: {type(e).__name__}: {e}", flush=True)
+        print(f"[LLM] Behavior agent error: {type(e).__name__}: {e}", flush=True)
         return None
 
+# ---------- Correlation Engine (Phase 3 — deterministic, no LLM) ----------
 
-def run_consensus(agent_findings, package_name, high_risk, api_calls, score, dynamic_ran=False):
-    """Generate final verdict, confidence, executive summary, and recommendations."""
+# Maps static API pattern descriptions to Frida event types for correlation
+STATIC_TO_DYNAMIC_MAP = {
+    # Static description → dynamic event_type
+    "OS Command Execution": "command_execution",
+    "Process Spawning": "command_execution",
+    "SMS Operations": "sms",
+    "SMS Sending": "sms",
+    "HTTP Network Connection": "network",
+    "Cleartext HTTP URL": "network",
+    "WebView Cleartext Load": "network",
+    "Weak Hash: MD5": "crypto",
+    "Weak Hash: SHA-1": "crypto",
+    "Weak Cipher: DES": "crypto",
+    "Weak Cipher: RC4": "crypto",
+    "Insecure Cipher Mode: ECB": "crypto",
+    "Dynamic DEX Loading": "file_access",
+    "Dynamic Class Loading": "file_access",
+    "File Write": "file_access",
+    "External Storage Access": "file_access",
+}
+
+
+def build_correlation_matrix(api_calls, dynamic_logs, sandbox_status):
+    """Deterministically correlate static API findings with dynamic Frida observations.
+    No LLM needed — this is pure pattern matching.
+
+    Returns a list of correlation entries showing which static capabilities
+    were validated (or not) by runtime evidence."""
+
+    correlations = []
+    dynamic_ran = sandbox_status and sandbox_status.get('success', False)
+    parsed_events = parse_frida_logs(dynamic_logs) if dynamic_logs else []
+
+    # Group dynamic events by type for fast lookup
+    dynamic_by_type = {}
+    for evt in parsed_events:
+        etype = evt['event_type']
+        if etype not in dynamic_by_type:
+            dynamic_by_type[etype] = []
+        dynamic_by_type[etype].append(evt)
+
+    # For each static API finding, check if there's a matching dynamic event
+    seen_capabilities = set()  # Deduplicate by capability category
+    for api_finding in api_calls:
+        desc = api_finding.get('description', '')
+        expected_event_type = STATIC_TO_DYNAMIC_MAP.get(desc)
+
+        if not expected_event_type:
+            continue  # No correlation mapping for this API type
+
+        # Deduplicate — only one correlation entry per capability category
+        if desc in seen_capabilities:
+            continue
+        seen_capabilities.add(desc)
+
+        static_evidence = f"{api_finding['api']} in {api_finding['file']}"
+
+        if not dynamic_ran:
+            # Dynamic analysis wasn't performed
+            correlations.append({
+                "capability": desc,
+                "static_evidence": static_evidence,
+                "dynamic_evidence": "Dynamic analysis was not performed",
+                "status": "NOT_TESTED",
+                "risk_assessment": f"Static capability detected. Runtime validation required.",
+            })
+        elif expected_event_type in dynamic_by_type:
+            # Found matching dynamic events — VALIDATED
+            matching_events = dynamic_by_type[expected_event_type]
+            dynamic_evidence = matching_events[0]['detail']
+            correlations.append({
+                "capability": desc,
+                "static_evidence": static_evidence,
+                "dynamic_evidence": dynamic_evidence,
+                "status": "VALIDATED",
+                "risk_assessment": f"Static capability confirmed by runtime observation. Elevated risk.",
+            })
+        else:
+            # Dynamic ran but this capability was NOT observed
+            correlations.append({
+                "capability": desc,
+                "static_evidence": static_evidence,
+                "dynamic_evidence": f"No {expected_event_type} activity observed in {len(parsed_events)} total events",
+                "status": "NOT_VALIDATED",
+                "risk_assessment": f"Code exists but was not triggered during {len(parsed_events)}-event observation window.",
+            })
+
+    # Count validation stats
+    validated_count = sum(1 for c in correlations if c['status'] == 'VALIDATED')
+    not_validated_count = sum(1 for c in correlations if c['status'] == 'NOT_VALIDATED')
+    not_tested_count = sum(1 for c in correlations if c['status'] == 'NOT_TESTED')
+
+    print(f"[Correlation] {len(correlations)} entries: "
+          f"{validated_count} validated, {not_validated_count} not validated, "
+          f"{not_tested_count} not tested", flush=True)
+
+    return correlations
+
+
+
+def run_consensus(agent_findings, package_name, high_risk, api_calls, score,
+                   dynamic_ran=False, correlation_matrix=None):
+    """Generate final verdict, confidence, executive summary, and recommendations.
+    Uses correlation matrix to drive evidence-based verdict decisions."""
     if not llm_client or not agent_findings:
         return None
 
-    agent_summaries = "\n".join(
-        f"- **{k.title()} Agent**: {v.get('detail', v.get('summary', 'N/A'))}"
-        for k, v in agent_findings.items()
-    )
+    correlation_matrix = correlation_matrix or []
 
-    # Determine what analysis phases were actually completed
+    # Build structured agent summary (not just detail dumps)
+    agent_summaries = ""
+    for agent_id, agent_data in agent_findings.items():
+        summary = agent_data.get('summary', 'N/A')
+        findings = agent_data.get('findings', [])
+        agent_summaries += f"\n### {agent_id.title()} Agent\n"
+        agent_summaries += f"Summary: {summary}\n"
+        if findings:
+            for f in findings[:3]:
+                evidence = f.get('evidence', '')
+                interp = f.get('interpretation', '')
+                conf = f.get('confidence', '')
+                validation = f.get('runtime_validation', 'NOT_TESTED')
+                agent_summaries += f"- [{conf}] {evidence}: {interp} (Runtime: {validation})\n"
+
+    # Build correlation summary
+    validated = [c for c in correlation_matrix if c['status'] == 'VALIDATED']
+    not_validated = [c for c in correlation_matrix if c['status'] == 'NOT_VALIDATED']
+    not_tested = [c for c in correlation_matrix if c['status'] == 'NOT_TESTED']
+
+    correlation_summary = f"""
+### Correlation Analysis
+- **Validated** (static capability confirmed at runtime): {len(validated)}
+- **Not Validated** (code exists, not observed at runtime): {len(not_validated)}
+- **Not Tested** (no dynamic analysis performed): {len(not_tested)}
+"""
+    if validated:
+        correlation_summary += "\nValidated capabilities:\n"
+        for c in validated:
+            correlation_summary += f"- {c['capability']}: Static={c['static_evidence']} → Runtime={c['dynamic_evidence']}\n"
+    if not_validated:
+        correlation_summary += "\nNot validated (code exists, not triggered):\n"
+        for c in not_validated:
+            correlation_summary += f"- {c['capability']}: {c['static_evidence']} — {c['dynamic_evidence']}\n"
+
     has_dynamic = dynamic_ran
+    analysis_scope = "Static + Dynamic analysis" if has_dynamic else "Static analysis ONLY (no runtime/dynamic analysis was performed)"
 
-    system_prompt = f"""You are the ARGUS Consensus Engine. Given the findings from 6 specialized agents analyzing an Android APK, produce a final verdict.
+    system_prompt = f"""You are the ARGUS Consensus Engine. Produce a final verdict based on agent findings and the correlation matrix.
 
-ANALYSIS SCOPE: {"Static + Dynamic analysis" if has_dynamic else "Static analysis ONLY (no runtime/dynamic analysis was performed)"}
+ANALYSIS SCOPE: {analysis_scope}
 
-VERDICT CALIBRATION RULES (YOU MUST FOLLOW THESE):
-- Use a 4-tier scale: "benign", "suspicious", "high-risk", "malicious"
-- "malicious" REQUIRES dynamic analysis confirming observed harmful behavior (data exfiltration, unauthorized network calls, actual SMS sending). If only static analysis was performed, you CANNOT use "malicious".
-- "high-risk" means: static analysis found dangerous capabilities, insecure configurations, and patterns consistent with known threat families, but no runtime confirmation. This is the MAXIMUM verdict for static-only analysis with strong findings.
-- "suspicious" means: some concerning patterns found but they could be legitimate.
-- "benign" means: no significant security concerns found.
+CORRELATION DATA DRIVES YOUR VERDICT:
+- VALIDATED correlations = highest weight (static capability was confirmed at runtime)
+- NOT_VALIDATED = the code exists but was not triggered during testing — this is NOT evidence of absence
+- NOT_TESTED = dynamic analysis was not performed — you cannot confirm or deny runtime behavior
 
-CONFIDENCE CALIBRATION RULES:
-- Static-only analysis: confidence MUST NOT exceed 85%, regardless of findings.
-- The confidence represents how certain you are about the VERDICT, not how many vulnerabilities you found.
-- Finding many vulnerabilities in a test/training app does NOT mean high malicious confidence.
-- If the package name suggests a deliberately vulnerable/test application, note this and adjust confidence downward for malware attribution.
+VERDICT RULES (STRICT):
+- "malicious": REQUIRES ≥2 VALIDATED dangerous behaviors (e.g., SMS actually sent + data actually exfiltrated). Static-only analysis CANNOT produce "malicious".
+- "high-risk": ≥1 VALIDATED dangerous behavior, OR strong static indicators (hardcoded backdoor credentials, obfuscated C2 URLs) even without validation. This is the MAX for static-only with strong evidence.
+- "suspicious": Dangerous capabilities exist in code but none were validated at runtime, OR static-only analysis with concerning patterns.
+- "benign": No significant static or dynamic findings.
+
+CONFIDENCE FORMULA (follow this exactly):
+- Base: 50%
+- +10% per VALIDATED correlation
+- +5% per HIGH-confidence static finding (from agent findings)
+- +3% per MEDIUM-confidence static finding
+- -10% if analysis was static-only (no dynamic phase)
+- -15% if package name contains "test", "demo", "sample", "insecure", "vulnerable", "training"
+- Cap at 95% maximum (never claim certainty)
+- Show your calculation in a "confidence_breakdown" field
 
 EXECUTIVE SUMMARY RULES:
-- Always state which analysis phases were completed and which were not.
-- Use "capable of" / "contains code for" instead of "performs" / "executes" when describing static findings.
-- End with a clear statement of limitations: "Dynamic validation has not yet been performed."
+- First sentence: what analysis was performed
+- State specific findings as capabilities or observations (depending on evidence type)
+- NEVER use: may, might, could, potentially, likely, possibly, suggests, indicates
+- Final sentence: state limitations clearly
 
-You MUST respond with valid JSON only (no markdown fences, no extra text). Use this exact schema:
+ANALYST SUMMARY RULES:
+- Provide a brief summary of the findings and what stood out.
+- Mention all the normal stuff a person would need to know when analyzing the apk.
+- Keep it direct and focused on key takeaways for a human analyst.
+
+You MUST respond with valid JSON only (no markdown fences, no extra text):
 {{
-  "verdict": "benign" | "suspicious" | "high-risk" | "malicious",
-  "confidence": 0-100,
-  "executive_summary": "A 3-5 sentence executive summary.",
+  "verdict": "suspicious",
+  "confidence": 80,
+  "confidence_breakdown": "Base 50 + 30 = 80",
+  "executive_summary": "3-5 sentence evidence-based summary.",
+  "analyst_summary": "Brief summary of what stood out and key analyst takeaways.",
   "recommended_actions": "2-3 specific recommended actions.",
-  "mitre_techniques": ["T1234: Technique Name", ...]
-}}
-"""
+  "mitre_techniques": ["T1234: Technique Name"]
+}}"""
 
-    user_msg = f"""## Agent Findings for {package_name}
+    user_msg = f"""## Consensus Input for {package_name}
 
 {agent_summaries}
 
+{correlation_summary}
+
 **Rule-based risk score**: {score}%
 **High-risk permissions**: {len(high_risk)}
-**Suspicious API calls**: {len(api_calls)}"""
+**HIGH signal API findings (app code)**: {len([a for a in api_calls if not a.get('is_library', False) and a.get('signal') == 'HIGH'])}
+**MEDIUM signal API findings (app code)**: {len([a for a in api_calls if not a.get('is_library', False) and a.get('signal') == 'MEDIUM'])}
+**LOW signal API findings (noise, not listed)**: {len([a for a in api_calls if not a.get('is_library', False) and a.get('signal') == 'LOW'])}"""
 
-    try:
-        print("[LLM] Sending consensus request...", flush=True)
-        response = llm_client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[LLM] Sending consensus request (attempt {attempt}/{max_attempts})...", flush=True)
+            messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=1000,
-        )
-        raw = response.choices[0].message.content.strip()
-        print(f"[LLM] Consensus received ({len(raw)} chars)", flush=True)
+            ]
+            if attempt == 1:
+                log_llm_prompt("Consensus Agent", messages)
+            response = llm_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=messages,
+                temperature=0.2 + (attempt - 1) * 0.1,
+                max_tokens=2000,
+            )
+            raw = response.choices[0].message.content.strip()
+            print(f"[LLM] Consensus received ({len(raw)} chars)", flush=True)
 
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        consensus = json.loads(raw)
-        return consensus
-    except json.JSONDecodeError as e:
-        print(f"[LLM] Consensus JSON parse error: {e}\nRaw: {raw[:500]}", flush=True)
-        return None
-    except Exception as e:
-        print(f"[LLM] Consensus error: {type(e).__name__}: {e}", flush=True)
-        return None
+            consensus = _parse_llm_json(raw)
+            # Apply language enforcement to consensus output too
+            consensus = enforce_language_on_findings(consensus)
+            return consensus
+        except json.JSONDecodeError as e:
+            print(f"[LLM] Consensus JSON parse error (attempt {attempt}): {e}\nRaw: {raw[:500]}", flush=True)
+            if attempt == max_attempts:
+                return None
+        except Exception as e:
+            print(f"[LLM] Consensus error (attempt {attempt}): {type(e).__name__}: {e}", flush=True)
+            if attempt == max_attempts:
+                return None
 
 
 # ---------- Routes ----------
@@ -700,32 +1369,136 @@ def analyze_apk():
             dynamic_logs = sandbox_res.get('logs', [])
             print(f"[analyze_apk] Sandbox collected {len(dynamic_logs)} logs.", flush=True)
 
-        # 9. Rule-based score (kept as baseline)
+        # 9. Rule-based score — per-finding weighted (not flat count)
+        # Each API pattern has a specific point value based on actual threat severity.
+        # LOW signal APIs (SharedPreferences, HttpURLConnection, etc.) score 0.
+        API_SCORE_WEIGHTS = {
+            # CRITICAL — 25 points each (genuine malware indicators)
+            "Runtime.getRuntime().exec": 25,
+            "ProcessBuilder": 25,
+            "SmsManager": 25,
+            "sendTextMessage": 25,
+            "DexClassLoader": 25,
+            "AccessibilityService": 25,
+            "onAccessibilityEvent": 25,
+            "DevicePolicyManager": 25,
+            "getSubscriberId": 20,
+            "getDeviceId": 20,
+            "getLine1Number": 20,
+            "MediaRecorder": 20,
+            "Camera.open": 20,
+            "lockNow": 20,
+            # HIGH — 15 points each
+            "getLastKnownLocation": 15,
+            "requestLocationUpdates": 15,
+            "ClipboardManager": 15,
+            "addJavascriptInterface": 15,
+            "setWebContentsDebuggingEnabled": 15,
+            # MEDIUM — 10 points each
+            "setJavaScriptEnabled(true)": 10,
+            "loadUrl(\"http://": 10,
+            "PathClassLoader": 10,
+            "getExternalStorageDirectory": 10,
+            "openFileOutput(": 5,
+            "URL(\"http://": 5,
+            # Crypto weaknesses — 5 points each
+            "getInstance(\"MD5\")": 5,
+            "getInstance(\"SHA-1\")": 5,
+            "getInstance(\"DES\")": 5,
+            "getInstance(\"RC4\")": 5,
+            "ECB": 5,
+            "NoPadding": 5,
+            # Evasion indicators — 5 points each
+            "su\"": 5,
+            "RootBeer": 5,
+            "isRooted": 5,
+            "detect_emulator": 5,
+            "Build.FINGERPRINT": 5,
+        }
+
         score = 0
+        # Permission contribution: proportional but capped at 15
         if permissions:
-            score += (len(used_high_risk) / len(permissions)) * 50
-        if api_calls:
-            score += min(30, len(api_calls) * 3)
-        # Manifest vulns add directly to score
-        high_manifest_vulns = [v for v in manifest_vulns if v.get('severity') == 'HIGH']
-        score += min(15, len(high_manifest_vulns) * 5)
+            score += min(15, (len(used_high_risk) / len(permissions)) * 15)
+
+        # API contribution: per-finding weighted, app code only
+        api_score = 0
+        for a in api_calls:
+            if a.get('is_library', False):
+                continue
+            api_score += API_SCORE_WEIGHTS.get(a['api'], 0)
+        score += min(40, api_score)  # cap API contribution at 40
+
+        # Manifest vulns: exported components and unprotected providers are serious
+        for v in manifest_vulns:
+            if v.get('id') == 'MANIFEST_UNPROTECTED_PROVIDER':
+                score += 20
+            elif v.get('id') == 'MANIFEST_EXPORTED_COMPONENTS':
+                score += 10
+            elif v.get('severity') == 'HIGH':
+                score += 5
+            elif v.get('severity') == 'MEDIUM':
+                score += 2
+
+        # Hardcoded secrets
         if hardcoded_secrets:
-            score += min(10, len(hardcoded_secrets) * 5)
-        if dynamic_logs and len(dynamic_logs) > 0:
-            score = min(99, score + 15)
+            score += min(15, len(hardcoded_secrets) * 5)
+
+        # Dynamic activity bonus — only if actual events were captured
+        parsed_dynamic_events = [l for l in (dynamic_logs or []) if isinstance(l, str) and not l.startswith("Frida")]
+        if parsed_dynamic_events:
+            score += 15
+
         score = round(min(99, score), 2)
 
-        # 10. LLM Analysis
-        agent_findings = run_llm_analysis(
+        # 10. LLM Static Analysis (Permission, Code, Network, Threat Intel agents)
+        static_findings = run_static_agents(
             package_name, permissions, used_high_risk, api_calls, code_snippets,
-            manifest_snippet, dynamic_logs, manifest_vulns, hardcoded_secrets
+            manifest_snippet, manifest_vulns, hardcoded_secrets
         )
 
-        # 11. LLM Consensus
+        # 11. LLM Behavior Agent (dynamic evidence ONLY — separated from static)
         dynamic_ran = sandbox_status.get('success', False)
-        consensus = run_consensus(agent_findings, package_name, used_high_risk, api_calls, score, dynamic_ran=dynamic_ran)
+        behavior_findings = run_behavior_agent(
+            dynamic_logs, sandbox_status, duration_seconds=10
+        )
+
+        # 12. Merge agent findings (static + behavior) for downstream consumption
+        agent_findings = {}
+        if static_findings:
+            agent_findings.update(static_findings)
+        if behavior_findings:
+            agent_findings.update(behavior_findings)
+
+        # Generate backward-compatible summary/detail for each agent
+        # (the frontend currently expects {summary, detail} per agent)
+        for agent_id in ['perm', 'code', 'network', 'threat', 'behavior']:
+            if agent_id in agent_findings:
+                agent_data = agent_findings[agent_id]
+                # Ensure summary exists
+                if 'summary' not in agent_data:
+                    agent_data['summary'] = 'Analysis complete'
+                # Build detail from findings if not present
+                if 'detail' not in agent_data and 'findings' in agent_data:
+                    details = []
+                    for f in agent_data['findings'][:3]:
+                        interp = f.get('interpretation', f.get('evidence', ''))
+                        conf = f.get('confidence', '')
+                        validation = f.get('runtime_validation', 'NOT_TESTED')
+                        details.append(f"[{conf}] {interp} (Validation: {validation})")
+                    agent_data['detail'] = ' '.join(details) if details else agent_data['summary']
+
+        # 13. Build correlation matrix (deterministic — no LLM needed)
+        correlation_matrix = build_correlation_matrix(api_calls, dynamic_logs, sandbox_status)
+
+        # 14. LLM Consensus (now receives correlation data)
+        consensus = run_consensus(
+            agent_findings, package_name, used_high_risk, api_calls, score,
+            dynamic_ran=dynamic_ran, correlation_matrix=correlation_matrix
+        )
 
         # Build response
+        analysis_scope = 'static_and_dynamic' if dynamic_ran else 'static_only'
         result = {
             'package': package_name,
             'permissions': permissions,
@@ -734,12 +1507,14 @@ def analyze_apk():
             'manifest_vulnerabilities': manifest_vulns,
             'hardcoded_secrets': hardcoded_secrets,
             'dynamic_logs': dynamic_logs,
+            'correlations': correlation_matrix,
             'pipeline_status': {
                 'apktool': {'success': apktool_success, 'message': apktool_msg},
                 'jadx': {'success': jadx_success, 'message': jadx_msg},
                 'sandbox': sandbox_status
             },
             'permission_score_percent': score,
+            'analysis_scope': analysis_scope,
         }
 
         # Add LLM results if available
@@ -748,11 +1523,13 @@ def analyze_apk():
         if consensus:
             result['verdict'] = consensus.get('verdict', None)
             result['confidence'] = consensus.get('confidence', None)
+            result['confidence_breakdown'] = consensus.get('confidence_breakdown', None)
             result['executive_summary'] = consensus.get('executive_summary', None)
+            result['analyst_summary'] = consensus.get('analyst_summary', None)
             result['recommended_actions'] = consensus.get('recommended_actions', None)
             result['mitre_techniques'] = consensus.get('mitre_techniques', [])
 
-        print(f"[analyze_apk] DONE - verdict={result.get('verdict', 'N/A')}", flush=True)
+        print(f"[analyze_apk] DONE - verdict={result.get('verdict', 'N/A')} scope={analysis_scope}", flush=True)
         return jsonify(result)
     except Exception as e:
         print(f"[analyze_apk] ERROR: {type(e).__name__}: {e}", flush=True)
@@ -779,45 +1556,71 @@ def chat_followup():
     if not question:
         return jsonify({'error': 'No question provided'}), 400
 
-    system_prompt = """You are ARGUS, an Android APK security analysis assistant.
-You have just completed a multi-agent analysis of an APK and the user is asking follow-up questions.
-Answer based ONLY on the analysis data provided. Be specific, reference actual findings, and be concise (2-4 sentences).
-If asked about something not covered in the analysis, say so honestly."""
+    system_prompt = """You are ARGUS, an evidence-based Android APK security analysis assistant.
+You have completed a multi-agent analysis and the user is asking follow-up questions.
+
+RULES FOR ANSWERING:
+1. Answer based ONLY on the analysis data provided. Do not speculate.
+2. Distinguish between:
+   - "Detected in code" (static capability) — the code exists but was not necessarily executed
+   - "Observed at runtime" (dynamic observation) — Frida hooks actually intercepted this behavior
+   - "Validated" (correlation) — a static capability was confirmed by runtime observation
+3. If asked "does the app do X?", clarify whether X was observed at runtime or is merely a code capability.
+4. NEVER use: may, might, could, potentially, likely, possibly, suggests, indicates
+5. If the user asks about something not covered in the analysis, say "This was not analyzed" rather than guessing.
+6. Be concise (2-4 sentences) and reference specific evidence."""
 
     # Build context from the report
     ctx_parts = [f"**Package**: {report_context.get('package', 'unknown')}"]
+    scope = report_context.get('analysisScope', 'static_only')
+    ctx_parts.append(f"**Analysis Scope**: {'Static + Dynamic' if scope == 'static_and_dynamic' else 'Static Only'}")
     if report_context.get('verdict'):
         ctx_parts.append(f"**Verdict**: {report_context['verdict']} ({report_context.get('confidence', '?')}% confidence)")
-    if report_context.get('executive_summary'):
-        ctx_parts.append(f"**Executive Summary**: {report_context['executive_summary']}")
+    if report_context.get('confidenceBreakdown'):
+        ctx_parts.append(f"**Confidence Breakdown**: {report_context['confidenceBreakdown']}")
+    if report_context.get('executiveSummary'):
+        ctx_parts.append(f"**Executive Summary**: {report_context['executiveSummary']}")
     if report_context.get('highRisk'):
-        ctx_parts.append(f"**High-Risk Permissions**: {', '.join(report_context['highRisk'])}")
+        ctx_parts.append(f"**High-Risk Permissions (capabilities)**: {', '.join(report_context['highRisk'])}")
     if report_context.get('apiCalls'):
-        apis = [f"{a['api']} in {a['file']}" for a in report_context['apiCalls'][:10]]
-        ctx_parts.append(f"**Suspicious APIs**: {', '.join(apis)}")
-    if report_context.get('mitre_techniques'):
-        ctx_parts.append(f"**MITRE ATT&CK**: {', '.join(report_context['mitre_techniques'])}")
-    if report_context.get('agent_findings'):
-        for agent_id, finding in report_context['agent_findings'].items():
-            detail = finding.get('detail', finding.get('summary', ''))
-            ctx_parts.append(f"**{agent_id.title()} Agent**: {detail}")
-    if report_context.get('recommended_actions'):
-        ctx_parts.append(f"**Recommended Actions**: {report_context['recommended_actions']}")
+        app_apis = [a for a in report_context['apiCalls'][:10] if not a.get('is_library')]
+        if app_apis:
+            apis = [f"{a['api']} in {a['file']}" for a in app_apis]
+            ctx_parts.append(f"**App Code APIs (capabilities)**: {', '.join(apis)}")
+    if report_context.get('correlations'):
+        validated = [c for c in report_context['correlations'] if c.get('status') == 'VALIDATED']
+        not_validated = [c for c in report_context['correlations'] if c.get('status') == 'NOT_VALIDATED']
+        if validated:
+            ctx_parts.append(f"**Validated (runtime confirmed)**: {', '.join(c['capability'] for c in validated)}")
+        if not_validated:
+            ctx_parts.append(f"**Not Validated (code exists, not observed)**: {', '.join(c['capability'] for c in not_validated)}")
+    if report_context.get('mitreTechniques'):
+        ctx_parts.append(f"**MITRE ATT&CK**: {', '.join(report_context['mitreTechniques'])}")
+    if report_context.get('agentFindings'):
+        for agent_id, finding in report_context['agentFindings'].items():
+            summary = finding.get('summary', '')
+            ctx_parts.append(f"**{agent_id.title()} Agent**: {summary}")
+    if report_context.get('recommendedActions'):
+        ctx_parts.append(f"**Recommended Actions**: {report_context['recommendedActions']}")
 
     context = "\n".join(ctx_parts)
 
     try:
         print(f"[chat] Question: {question[:100]}", flush=True)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"## Analysis Context\n{context}\n\n## User Question\n{question}"},
+        ]
+        log_llm_prompt("Chat Assistant", messages)
         response = llm_client.chat.completions.create(
             model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"## Analysis Context\n{context}\n\n## User Question\n{question}"},
-            ],
-            temperature=0.4,
+            messages=messages,
+            temperature=0.3,
             max_tokens=500,
         )
         answer = response.choices[0].message.content.strip()
+        # Apply language enforcement to chat answers too
+        answer = enforce_language_rules(answer)
         print(f"[chat] Answer: {answer[:100]}...", flush=True)
         return jsonify({'answer': answer})
     except Exception as e:
