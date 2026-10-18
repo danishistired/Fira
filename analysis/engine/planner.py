@@ -1,12 +1,18 @@
 """
 Planner for ARGUS agentic investigation engine.
 
-The planner is the decision-maker. It receives the current investigation
-state from memory and returns a single JSON action telling the orchestrator
-which tool to execute next.
+The planner is an autonomous investigator. Each call to decide()
+sends the investigation state to DeepSeek and receives back structured
+reasoning: reflection, hypotheses, knowledge gaps, confidence, and
+the next tool action.
 
-This is where DeepSeek acts as an investigator, not a report writer.
-Each call to decide() is one "thought step" in the investigation.
+This is the agentic core — it doesn't just pick a tool, it THINKS.
+Every response includes:
+- reflection on what was learned
+- updated hypotheses with confidence scores
+- knowledge gaps driving the next decision
+- confidence evolution with reasoning
+- the next tool to execute with justification
 """
 
 import json
@@ -16,38 +22,43 @@ from shared.language import parse_llm_json, log_llm_prompt
 
 
 class Planner:
-    """DeepSeek-powered investigation planner.
+    """DeepSeek-powered autonomous investigation planner.
 
     Each call to decide() sends the investigation state to DeepSeek
-    and receives back a single tool action. This is the agentic core
-    that replaces the fixed pipeline.
+    and receives structured reasoning. The reasoning is stored in
+    memory before the action is returned to the orchestrator.
     """
 
     def __init__(self, llm_client):
         self.llm_client = llm_client
 
     def decide(self, memory: InvestigationMemory, tool_registry) -> dict:
-        """Ask DeepSeek to decide the next investigation step.
+        """Ask DeepSeek to reflect, reason, and decide the next step.
 
-        Args:
-            memory: Current investigation state
-            tool_registry: ToolRegistry instance (for tool descriptors)
-
-        Returns:
-            dict with keys: action, arguments, reason
-            Example: {"action": "run_jadx", "arguments": {"apk_path": "..."}, "reason": "..."}
+        Returns a dict with at minimum: action, arguments, reason.
+        Also stores reflection, hypotheses, knowledge_gaps, confidence,
+        and journal entry in memory.
         """
-        # Build the system prompt with tool descriptors
+        # Build the system prompt with tool descriptors + metadata
         tool_descriptors = tool_registry.list_tools()
         system_prompt = build_planner_system_prompt(tool_descriptors)
 
-        # Build the user message with investigation state
+        # Build the user message with investigation state + budget
         investigation_state = memory.get_planner_summary()
         available_tools = tool_registry.list_tool_names()
+        budget = memory.get_budget_status()
 
         user_message = f"""## Current Investigation State
 
 {investigation_state}
+
+## Budget Status
+- Budget spent: {budget['budget_spent']}/{budget['budget_total']} units
+- Budget remaining: {budget['budget_remaining']} units
+- Tool calls made: {budget['tool_calls']}
+- Coverage: {budget['coverage_percent']}%
+{"- WARNING: Budget is running low. Consider concluding soon." if budget['budget_remaining'] <= 8 else ""}
+{"- CRITICAL: Budget nearly exhausted. Conclude unless critical evidence is missing." if budget['budget_remaining'] <= 3 else ""}
 
 ## Available Tools
 {json.dumps(available_tools)}
@@ -55,10 +66,9 @@ class Planner:
 ## Constraints
 - apk_path: {memory.apk_path}
 - package_name: {memory.package_name}
-- iteration: {memory.iteration} of 15
 - Tools already run: {', '.join(memory.tool_outputs.keys()) if memory.tool_outputs else 'none'}
 
-Decide the next investigation step. Respond with ONLY a JSON object."""
+Reflect on the evidence, update your hypotheses, identify knowledge gaps, and decide the next investigation step. Respond with ONLY a JSON object."""
 
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
@@ -71,32 +81,37 @@ Decide the next investigation step. Respond with ONLY a JSON object."""
                 if attempt == 1:
                     log_llm_prompt(f"Planner (iteration {memory.iteration})", messages)
 
-                print(f"[Planner] Iteration {memory.iteration} — requesting decision "
+                print(f"[Planner] Iteration {memory.iteration} — requesting structured reasoning "
                       f"(attempt {attempt}/{max_attempts})...", flush=True)
 
                 response = self.llm_client.chat.completions.create(
                     model="deepseek-v4-flash",
                     messages=messages,
-                    temperature=0.1 + (attempt - 1) * 0.1,  # slightly higher on retry
-                    max_tokens=500,  # decisions are short
+                    temperature=0.1 + (attempt - 1) * 0.1,
+                    max_tokens=1500,  # structured reasoning is longer
                 )
 
                 raw = response.choices[0].message.content.strip()
-                print(f"[Planner] Received decision ({len(raw)} chars)", flush=True)
+                print(f"[Planner] Received reasoning ({len(raw)} chars)", flush=True)
 
                 decision = parse_llm_json(raw)
 
-                # Validate the decision structure
+                # Store all reasoning in memory BEFORE returning the action
+                self._store_reasoning(decision, memory)
+
+                # Validate and normalize the action for the orchestrator
                 decision = self._validate_decision(decision, memory, available_tools)
 
                 print(f"[Planner] Decision: {decision['action']} — {decision.get('reason', 'N/A')}",
                       flush=True)
+                if decision.get('confidence') is not None:
+                    print(f"[Planner] Confidence: {decision['confidence']}% — "
+                          f"{decision.get('confidence_reasoning', 'N/A')}", flush=True)
                 return decision
 
             except json.JSONDecodeError as e:
                 print(f"[Planner] JSON parse error (attempt {attempt}): {e}", flush=True)
                 if attempt == max_attempts:
-                    # Fallback: generate report if we can't parse the decision
                     print("[Planner] Falling back to generate_report after parse failures", flush=True)
                     return {
                         "action": "generate_report",
@@ -113,25 +128,68 @@ Decide the next investigation step. Respond with ONLY a JSON object."""
                         "reason": f"Planner error: {e}",
                     }
 
+    def _store_reasoning(self, decision: dict, memory: InvestigationMemory):
+        """Extract and store all reasoning fields from the planner's response.
+
+        This is what makes the planner truly agentic — it doesn't just
+        pick a tool, it reasons. We capture that reasoning for:
+        - The investigation journal (visible to the user)
+        - Hypothesis tracking (evolving across iterations)
+        - Knowledge gaps (driving next tool selection)
+        - Confidence history (showing how confidence evolved)
+        """
+        # 1. Store hypotheses
+        hypotheses = decision.get("hypotheses", [])
+        if hypotheses:
+            memory.update_hypotheses(hypotheses)
+
+        # 2. Store knowledge gaps
+        gaps = decision.get("knowledge_gaps", [])
+        memory.update_knowledge_gaps(gaps)
+
+        # 3. Record confidence
+        confidence = decision.get("confidence")
+        confidence_reasoning = decision.get("confidence_reasoning", "")
+        if confidence is not None:
+            memory.record_confidence(int(confidence), confidence_reasoning)
+
+        # 4. Add journal entry
+        journal_entry = {
+            "thought": decision.get("reflection", ""),
+            "current_understanding": decision.get("current_understanding", ""),
+            "action": decision.get("next_action", decision.get("action", "")),
+            "reason": decision.get("reason", ""),
+            "hypotheses_snapshot": [
+                {"hypothesis": h.get("hypothesis", ""), "confidence": h.get("confidence", 0), "status": h.get("status", "")}
+                for h in hypotheses[:5]
+            ],
+            "knowledge_gaps_snapshot": gaps[:5],
+            "confidence": confidence,
+        }
+        memory.add_journal_entry(journal_entry)
+
+        print(f"[Planner] Stored reasoning: {len(hypotheses)} hypotheses, "
+              f"{len(gaps)} gaps, confidence={confidence}%", flush=True)
+
     def _validate_decision(self, decision: dict, memory: InvestigationMemory,
                            available_tools: list[str]) -> dict:
-        """Validate and fix a planner decision.
+        """Validate and normalize a planner decision.
 
-        Ensures:
-        - 'action' is a valid tool name
-        - 'arguments' is a dict
-        - 'reason' is present
-        - apk_path and package_name are injected if needed
+        Maps the structured output (next_action) to the orchestrator's
+        expected format (action). Injects apk_path and package_name.
         """
+        # Map next_action -> action (backward compat with orchestrator)
+        if "next_action" in decision and "action" not in decision:
+            decision["action"] = decision["next_action"]
+
         # Ensure required fields
         if "action" not in decision:
-            raise ValueError("Decision missing 'action' field")
+            raise ValueError("Decision missing 'action' and 'next_action' fields")
 
         action = decision["action"]
 
         # Validate tool name
         if action not in available_tools:
-            # Try common corrections
             corrections = {
                 "extract_permissions": "scan_permissions",
                 "decompile": "run_jadx",
@@ -156,8 +214,7 @@ Decide the next investigation step. Respond with ONLY a JSON object."""
         if not isinstance(decision["arguments"], dict):
             decision["arguments"] = {}
 
-        # Inject apk_path and package_name if the tool needs them
-        # (the planner doesn't need to remember these — we inject them)
+        # Inject apk_path and package_name
         args = decision["arguments"]
         action = decision["action"]
 

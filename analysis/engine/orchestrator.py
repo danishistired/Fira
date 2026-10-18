@@ -1,19 +1,17 @@
 """
 Investigation orchestrator for ARGUS agentic engine.
 
-This is the main loop that replaces the fixed pipeline in app.py.
-It coordinates the planner, tool registry, and investigation memory
-to dynamically investigate each APK based on evidence.
+The main loop that coordinates planner, tool registry, and memory
+to dynamically investigate each APK based on evidence and reasoning.
 
 The orchestrator:
-1. Always starts with manifest extraction (the minimum viable step)
-2. Asks the planner what to do next based on accumulated evidence
-3. Executes the chosen tool
-4. Records the result in memory
-5. Repeats until the planner calls generate_report or iteration cap is hit
-6. Generates the final consensus verdict and builds the response
-
-The response JSON matches the exact shape the frontend expects.
+1. Always starts with manifest extraction (foundational step)
+2. Asks the planner to reflect, hypothesize, and decide the next tool
+3. Tracks budget expenditure per tool cost
+4. Records journal entries with the planner's full reasoning
+5. Builds correlation matrix from accumulated evidence
+6. Generates consensus verdict via LLM
+7. Builds backward-compatible response JSON with new agentic fields
 """
 
 import json
@@ -26,22 +24,18 @@ from shared.scoring import compute_risk_score
 from shared.evidence import build_correlation_matrix
 
 
-# Maximum investigation iterations (safety cap).
-# Typical investigations use 3-8 iterations. The cap prevents runaway loops.
-MAX_ITERATIONS = 15
+# Maximum investigation budget (cost units, not iterations).
+# very_low=1, low=2, medium=4, high=6
+# A full investigation (manifest+perms+jadx+frida+monkey) costs ~18 units
+MAX_BUDGET = 30
 
 
 class InvestigationOrchestrator:
     """The agentic investigation loop.
 
-    Replaces the fixed pipeline in app.py with a dynamic loop where
-    DeepSeek decides the next step based on accumulated evidence.
-    Each APK produces a different investigation path.
-
-    Usage:
-        orchestrator = InvestigationOrchestrator(llm_client, tool_registry)
-        result = orchestrator.investigate("/tmp/sample.apk")
-        # result is the same JSON shape as the old /analyze response
+    Each APK produces a different investigation path based on evidence.
+    The planner reflects and reasons at every step. Budget and hypotheses
+    evolve across iterations.
     """
 
     def __init__(self, llm_client, tool_registry):
@@ -52,25 +46,32 @@ class InvestigationOrchestrator:
     def investigate(self, apk_path: str) -> dict:
         """Run the full agentic investigation.
 
-        This is the main entry point. It runs the investigation loop
-        and returns the same JSON shape as the old pipeline.
-
-        If the LLM is unavailable, falls back to the old fixed pipeline
-        behavior (run all tools in order, skip LLM analysis).
+        Returns the same JSON shape as the old pipeline, plus new
+        agentic fields (journal, hypotheses, confidence_history).
         """
         memory = InvestigationMemory(apk_path=apk_path)
 
         print(f"\n{'='*60}", flush=True)
-        print(f"[Orchestrator] Starting investigation: {apk_path}", flush=True)
+        print(f"[Orchestrator] Starting agentic investigation: {apk_path}", flush=True)
 
         # ---- Step 1: Always extract manifest first ----
-        # This is the minimum viable step. Every investigation starts here.
         memory.iteration = 1
-        print(f"[Orchestrator] Iteration 1: extract_manifest (mandatory)", flush=True)
+        print(f"[Orchestrator] Iteration 1: extract_manifest (foundational)", flush=True)
         manifest_result = self.tools.execute("extract_manifest", apk_path=apk_path)
         memory.add_tool_result("extract_manifest", manifest_result)
-        memory.add_decision("extract_manifest", "First step — always extract manifest", 
+        memory.record_budget_cost("very_low")
+        memory.add_decision("extract_manifest", "Foundational step — manifest is always required",
                           manifest_result.get("summary", "Manifest extracted"))
+
+        # Record initial journal entry
+        memory.add_journal_entry({
+            "thought": "Beginning investigation. Manifest extraction is always the first step to understand the app's declared capabilities and attack surface.",
+            "action": "extract_manifest",
+            "reason": "Foundational step — always required",
+            "result": manifest_result.get("summary", ""),
+            "confidence": 10,
+        })
+        memory.record_confidence(10, "Initial — manifest extracted but no analysis yet")
 
         # If no LLM available, fall back to fixed pipeline
         if not self.llm_client:
@@ -78,10 +79,18 @@ class InvestigationOrchestrator:
             return self._fallback_pipeline(memory)
 
         # ---- Step 2+: Agentic investigation loop ----
+        MAX_ITERATIONS = 15  # Safety cap even with budget system
         for iteration in range(2, MAX_ITERATIONS + 1):
             memory.iteration = iteration
+            budget = memory.get_budget_status(MAX_BUDGET)
 
-            # Ask the planner what to do next
+            # Budget exhaustion check
+            if budget["budget_exhausted"]:
+                print(f"[Orchestrator] Budget exhausted ({budget['budget_spent']}/{MAX_BUDGET}). Forcing report.", flush=True)
+                memory.status = "complete"
+                break
+
+            # Ask the planner to reflect, reason, and decide
             decision = self.planner.decide(memory, self.tools)
             action = decision["action"]
             arguments = decision.get("arguments", {})
@@ -100,8 +109,11 @@ class InvestigationOrchestrator:
             memory.add_tool_result(action, result)
             memory.add_decision(action, reason, result.get("summary", "Tool executed"))
 
+            # Track budget cost from tool metadata
+            tool_cost = self._get_tool_cost(action)
+            memory.record_budget_cost(tool_cost)
+
         else:
-            # Hit iteration cap without planner calling generate_report
             print(f"[Orchestrator] Hit iteration cap ({MAX_ITERATIONS}). Forcing report.", flush=True)
             memory.status = "complete"
 
@@ -113,25 +125,27 @@ class InvestigationOrchestrator:
         # ---- Step 4: Generate consensus verdict via LLM ----
         consensus = self._generate_consensus(memory)
 
-        # ---- Step 5: Build response in the frontend-expected shape ----
+        # ---- Step 5: Build response ----
         return self._build_response(memory, consensus)
 
-    def _generate_consensus(self, memory: InvestigationMemory) -> dict:
-        """Generate the final verdict and agent findings using the consensus prompt.
+    def _get_tool_cost(self, tool_name: str) -> str:
+        """Look up a tool's cost from its metadata."""
+        try:
+            tool = self.tools.get(tool_name)
+            return tool.metadata.get("estimated_cost", "low")
+        except KeyError:
+            return "low"
 
-        This replaces run_static_agents() + run_behavior_agent() + run_consensus()
-        from the old pipeline. A single LLM call produces ALL agent perspectives
-        plus the final verdict.
-        """
+    def _generate_consensus(self, memory: InvestigationMemory) -> dict:
+        """Generate the final verdict and agent findings using the consensus prompt."""
         if not self.llm_client:
             return None
 
-        # Determine analysis scope
         dynamic_ran = memory.coverage.get("runtime_frida", False)
         scope_str = "Static + Dynamic analysis" if dynamic_ran else "Static analysis ONLY (no runtime/dynamic analysis was performed)"
         system_prompt = build_consensus_system_prompt(scope_str)
 
-        # Build the evidence summary for the consensus engine
+        # Build evidence summary for the consensus engine
         evidence_summary = memory.get_planner_summary()
 
         # Add correlation data
@@ -141,9 +155,9 @@ class InvestigationOrchestrator:
         not_tested = [c for c in memory.correlation_matrix if c['status'] == 'NOT_TESTED']
 
         correlation_lines.append(f"\n## Correlation Matrix")
-        correlation_lines.append(f"- Validated (confirmed at runtime): {len(validated)}")
-        correlation_lines.append(f"- Not Validated (code exists, not triggered): {len(not_validated)}")
-        correlation_lines.append(f"- Not Tested (no dynamic analysis): {len(not_tested)}")
+        correlation_lines.append(f"- Validated: {len(validated)}")
+        correlation_lines.append(f"- Not Validated: {len(not_validated)}")
+        correlation_lines.append(f"- Not Tested: {len(not_tested)}")
         if validated:
             for c in validated:
                 correlation_lines.append(f"  - VALIDATED: {c['capability']}: {c['static_evidence']} → {c['dynamic_evidence']}")
@@ -151,10 +165,10 @@ class InvestigationOrchestrator:
             for c in not_validated:
                 correlation_lines.append(f"  - NOT_VALIDATED: {c['capability']}: {c['static_evidence']}")
 
-        # Add code snippets if available (for the consensus engine to reference)
+        # Add code snippets if available
         snippet_lines = []
         if memory.code_snippets:
-            snippet_lines.append(f"\n## Code Snippets (context around HIGH/MEDIUM findings)")
+            snippet_lines.append(f"\n## Code Snippets")
             for s in memory.code_snippets[:5]:
                 snippet_lines.append(f"\n--- {s['file']} (line {s['line']}, API: {s['api']}) ---")
                 snippet_lines.append(f"```java\n{s['code']}\n```")
@@ -166,6 +180,13 @@ class InvestigationOrchestrator:
             memory.hardcoded_secrets, memory.raw_dynamic_logs
         )
 
+        # Investigation hypotheses (provide to consensus for context)
+        hypothesis_lines = []
+        if memory.hypotheses:
+            hypothesis_lines.append(f"\n## Investigation Hypotheses")
+            for h in memory.hypotheses:
+                hypothesis_lines.append(f"- [{h.get('status', '?').upper()}] {h['hypothesis']} ({h.get('confidence', 0)}%)")
+
         # Investigation timeline
         timeline_lines = ["\n## Investigation Timeline"]
         for d in memory.decisions:
@@ -175,6 +196,7 @@ class InvestigationOrchestrator:
             evidence_summary +
             "\n".join(correlation_lines) +
             "\n".join(snippet_lines) +
+            "\n".join(hypothesis_lines) +
             "\n".join(timeline_lines) +
             f"\n\n**Rule-based risk score**: {risk_score}%"
             f"\n**Package**: {memory.package_name}"
@@ -210,35 +232,31 @@ class InvestigationOrchestrator:
                     return None
 
     def _build_response(self, memory: InvestigationMemory, consensus: dict) -> dict:
-        """Build the response JSON in the exact shape the frontend expects.
-
-        This is the backward-compatibility layer. The frontend sees no
-        difference between the old pipeline and the new agentic engine.
-        """
+        """Build the response JSON — backward compatible + new agentic fields."""
         dynamic_ran = memory.coverage.get("runtime_frida", False)
         analysis_scope = "static_and_dynamic" if dynamic_ran else "static_only"
 
-        # Compute risk score
         risk_score = compute_risk_score(
             memory.permissions, memory.high_risk_permissions,
             memory.api_calls, memory.manifest_vulnerabilities,
             memory.hardcoded_secrets, memory.raw_dynamic_logs
         )
 
-        # Build pipeline status (backward compat)
+        # Pipeline status (backward compat)
         pipeline_status = {
             "apktool": {
                 "success": memory.coverage.get("apktool_resources", False),
-                "message": "APKTool extraction successful" if memory.coverage.get("apktool_resources") else "Not run (planner decided to skip)",
+                "message": "APKTool extraction successful" if memory.coverage.get("apktool_resources") else "Planner decided to skip",
             },
             "jadx": {
                 "success": memory.coverage.get("source_code", False),
-                "message": "JADX decompilation successful" if memory.coverage.get("source_code") else "Not run (planner decided to skip)",
+                "message": "JADX decompilation successful" if memory.coverage.get("source_code") else "Planner decided to skip",
             },
             "sandbox": memory.sandbox_status,
         }
 
         result = {
+            # Existing fields (backward compatible)
             "package": memory.package_name,
             "permissions": memory.permissions,
             "high_risk_permissions": memory.high_risk_permissions,
@@ -250,10 +268,18 @@ class InvestigationOrchestrator:
             "pipeline_status": pipeline_status,
             "permission_score_percent": risk_score,
             "analysis_scope": analysis_scope,
-            # Investigation metadata (new — frontend can optionally display)
+
+            # Agentic investigation metadata
             "investigation_timeline": memory.decisions,
             "investigation_iterations": memory.iteration,
             "investigation_coverage": memory.get_coverage_report(),
+
+            # NEW: Agentic reasoning data (for frontend investigation journal)
+            "investigation_journal": memory.journal,
+            "investigation_hypotheses": memory.hypotheses,
+            "confidence_history": memory.confidence_history,
+            "knowledge_gaps": memory.knowledge_gaps,
+            "investigation_budget": memory.get_budget_status(MAX_BUDGET),
         }
 
         # Add consensus/LLM results if available
@@ -266,10 +292,7 @@ class InvestigationOrchestrator:
             result["recommended_actions"] = consensus.get("recommended_actions")
             result["mitre_techniques"] = consensus.get("mitre_techniques", [])
 
-            # Agent findings from consensus (replaces individual agent calls)
             agent_findings = consensus.get("agent_findings", {})
-
-            # Ensure backward-compatible structure for each agent
             for agent_id in ["perm", "code", "network", "threat", "behavior"]:
                 if agent_id in agent_findings:
                     agent_data = agent_findings[agent_id]
@@ -283,10 +306,8 @@ class InvestigationOrchestrator:
                             validation = f.get("runtime_validation", "NOT_TESTED")
                             details.append(f"[{conf}] {interp} (Validation: {validation})")
                         agent_data["detail"] = " ".join(details) if details else agent_data["summary"]
-
             result["agent_findings"] = agent_findings
         else:
-            # No LLM — provide rule-based fallbacks
             result["verdict"] = (
                 "high-risk" if risk_score > 70 else
                 "suspicious" if risk_score > 40 else
@@ -295,18 +316,14 @@ class InvestigationOrchestrator:
             result["confidence"] = min(99, 60 + round(risk_score / 3))
 
         print(f"[Orchestrator] DONE — verdict={result.get('verdict')} "
-              f"scope={analysis_scope} iterations={memory.iteration}", flush=True)
+              f"scope={analysis_scope} iterations={memory.iteration} "
+              f"hypotheses={len(memory.hypotheses)} journal={len(memory.journal)}", flush=True)
         return result
 
     def _fallback_pipeline(self, memory: InvestigationMemory) -> dict:
-        """Fallback: run all tools in fixed order when no LLM is available.
-
-        This preserves the old pipeline behavior for cases where
-        DEEPSEEK_API_KEY is not set.
-        """
+        """Fallback: run all tools in fixed order when no LLM is available."""
         print("[Orchestrator] Running fallback pipeline (no LLM)...", flush=True)
 
-        # Run all tools in sequence
         tools_to_run = [
             ("scan_permissions", {"apk_path": memory.apk_path}),
             ("run_apktool", {"apk_path": memory.apk_path}),
@@ -318,7 +335,7 @@ class InvestigationOrchestrator:
             memory.iteration += 1
             result = self.tools.execute(tool_name, **args)
             memory.add_tool_result(tool_name, result)
-            memory.add_decision(tool_name, "Fallback pipeline — running all tools", 
+            memory.add_decision(tool_name, "Fallback pipeline — running all tools",
                               result.get("summary", "Done"))
 
         memory.status = "complete"
