@@ -45,3 +45,7 @@ tools/
 # LLM prompt logs (debug output, not for VCS)
 in/prompts_log.txt
 in/*.txt
+
+# to-do
+to-do.md
+    
