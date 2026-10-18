@@ -25,10 +25,13 @@ import tempfile
 import json
 import logging
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
+import threading
+import queue
+import time
 
 # ---------- Path Setup ----------
 # Add the analysis directory to sys.path so that shared/, tools/, engine/
@@ -134,6 +137,90 @@ def analyze_apk():
             os.remove(tmp_path)
         except Exception:
             pass
+
+
+@app.route('/analyze/stream', methods=['POST'])
+def analyze_apk_stream():
+    """Streaming SSE version of /analyze.
+
+    Emits real-time progress events as the agentic investigation runs,
+    then sends the final result as the last event.
+
+    SSE event types emitted:
+      status          — investigation phase change
+      tool_start      — a tool is about to execute
+      tool_done       — a tool finished executing
+      planner_thinking — planner is calling the LLM
+      planner_decision — planner chose next action with reasoning
+      consensus_start — final verdict generation starting
+      complete        — investigation done (data = full result JSON)
+      error           — investigation failed
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'no file provided'}), 400
+    f = request.files['file']
+    if f.filename == '':
+        return jsonify({'error': 'empty filename'}), 400
+
+    # Save to temp file before streaming starts
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk')
+    os.close(tmp_fd)
+    f.save(tmp_path)
+
+    # Queue for passing SSE events from the background thread to the generator
+    event_queue: queue.Queue = queue.Queue()
+    SENTINEL = object()  # signals the stream is done
+
+    def emit(event_type: str, data: dict):
+        event_queue.put((event_type, data))
+
+    def run_investigation():
+        try:
+            result = orchestrator.investigate(tmp_path, emit=emit)
+            # Send the full result as the terminal event
+            event_queue.put(("result", result))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            event_queue.put(("error", {"message": str(e)}))
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            event_queue.put(SENTINEL)
+
+    thread = threading.Thread(target=run_investigation, daemon=True)
+    thread.start()
+
+    def generate():
+        while True:
+            try:
+                item = event_queue.get(timeout=120)  # 2-min max wait per event
+            except queue.Empty:
+                # Send keep-alive ping
+                yield ": ping\n\n"
+                continue
+
+            if item is SENTINEL:
+                break
+
+            event_type, data = item
+            payload = json.dumps(data)
+            yield f"event: {event_type}\ndata: {payload}\n\n"
+
+            if event_type in ("result", "error"):
+                break
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @app.route('/chat', methods=['POST'])

@@ -106,18 +106,6 @@ const AGENT_TEMPLATE: Omit<Agent, "status">[] = [
   { id: "consensus", name: "Consensus Agent" },
 ];
 
-const PIPELINE_STEPS = [
-  "Reading APK manifest",
-  "Inspecting permissions",
-  "Decompiling classes.dex",
-  "Running static analysis",
-  "Executing sandbox",
-  "Monitoring network activity",
-  "Correlating threat intelligence",
-  "Running multi-agent review",
-  "Generating verdict",
-  "Building report",
-];
 
 const newId = () => Math.random().toString(36).slice(2, 10);
 
@@ -199,7 +187,7 @@ export function Home() {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [active?.messages.length, active?.timeline.length, active?.report]);
 
-  // ---------- upload (reuses existing /analyze backend) ----------
+  // ---------- upload — real-time SSE progress ----------
   const startUpload = async (file: File) => {
     const convId = activeId;
     updateActive((c) => ({
@@ -213,129 +201,259 @@ export function Home() {
       report: null,
     }));
 
-    // simulate live activity stream
-    const pushStep = (label: string) => {
+    // Helpers that always write into the correct conversation slot
+    const pushTimelineStep = (label: string, stepId: string, stepStatus: "running" | "done") => {
+      setConversations((list) =>
+        list.map((c) => {
+          if (c.id !== convId) return c;
+          const existing = c.timeline.find((t) => t.id === stepId);
+          if (existing) {
+            // Update the existing step's status
+            return {
+              ...c,
+              timeline: c.timeline.map((t) =>
+                t.id === stepId ? { ...t, status: stepStatus } : t,
+              ),
+            };
+          }
+          // Mark previous running step as done, add new one
+          return {
+            ...c,
+            timeline: [
+              ...c.timeline.map((t) =>
+                t.status === "running" ? { ...t, status: "done" as const } : t,
+              ),
+              { id: stepId, label, status: stepStatus, ts: Date.now() },
+            ],
+          };
+        }),
+      );
+    };
+
+    const setAgentStatus = (agentId: string, status: AgentStatus, summary?: string) => {
+      if (!agentId) return;
       setConversations((list) =>
         list.map((c) =>
-          c.id === convId
-            ? {
+          c.id !== convId
+            ? c
+            : { ...c, agents: c.agents.map((a) => (a.id === agentId ? { ...a, status, summary } : a)) },
+        ),
+      );
+    };
+
+    const markAllDone = () => {
+      setConversations((list) =>
+        list.map((c) =>
+          c.id !== convId
+            ? c
+            : {
                 ...c,
-                timeline: [
-                  ...c.timeline.map((t) => ({ ...t, status: "done" as const })),
-                  { id: newId(), label, status: "running", ts: Date.now() },
-                ],
-              }
-            : c,
-        ),
-      );
-    };
-    const setAgent = (id: string, status: AgentStatus, summary?: string, duration?: number) => {
-      setConversations((list) =>
-        list.map((c) =>
-          c.id === convId
-            ? { ...c, agents: c.agents.map((a) => (a.id === id ? { ...a, status, summary, duration } : a)) }
-            : c,
+                timeline: c.timeline.map((t) => ({ ...t, status: "done" as const })),
+                agents: c.agents.map((a) => (a.status === "running" ? { ...a, status: "done" } : a)),
+              },
         ),
       );
     };
 
-    let stepIdx = 0;
-    const stepTimer = window.setInterval(() => {
-      if (stepIdx < PIPELINE_STEPS.length) {
-        pushStep(PIPELINE_STEPS[stepIdx]);
-        stepIdx++;
-      }
-    }, 700);
+    // Use FormData + fetch to upload, then parse SSE from the response body
+    const form = new FormData();
+    form.append("file", file);
 
-    const agentTimers: number[] = [];
-    AGENT_TEMPLATE.forEach((a, i) => {
-      agentTimers.push(window.setTimeout(() => setAgent(a.id, "running"), 800 + i * 900));
-    });
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let aborted = false;
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const response = await fetch("http://localhost:5050/analyze", { method: "POST", body: form });
-      const result = await response.json();
-      window.clearInterval(stepTimer);
-      agentTimers.forEach(clearTimeout);
-
-      if (!response.ok) throw new Error(result?.error ?? "Analysis failed");
-
-      const highRisk: string[] = result.high_risk_permissions ?? [];
-      const score: number = result.permission_score_percent ?? 0;
-      const apiCalls = result.api_calls ?? [];
-      const pipelineStatus = result.pipeline_status ?? {
-        apktool: { success: false, message: "Not run" },
-        jadx: { success: false, message: "Not run" },
-        sandbox: { success: false, message: "Not run" }
-      };
-      // Use LLM verdict if available, otherwise fallback to rule-based
-      const verdict: "benign" | "suspicious" | "high-risk" | "malicious" =
-        result.verdict ?? (score > 70 ? "high-risk" : score > 40 ? "suspicious" : "benign");
-      const confidence: number = result.confidence ?? Math.min(99, 60 + Math.round(score / 3));
-      const agentFindings: Record<string, AgentFinding> | undefined = result.agent_findings;
-
-      // Use LLM agent summaries if available, otherwise fallback
-      const fallbackSummaries: Record<string, string> = {
-        perm: `${highRisk.length} high-risk permissions`,
-        code: "Static scan complete",
-        behavior: "No anomalous runtime patterns",
-        network: "Outbound traffic profile captured",
-        threat: "Correlated against intel feeds",
-        consensus: `Verdict: ${verdict}`,
-      };
-      AGENT_TEMPLATE.forEach((a, i) => {
-        const finding = agentFindings?.[a.id];
-        setAgent(a.id, "done", finding?.summary ?? fallbackSummaries[a.id], 4 + i * 3);
+      const response = await fetch("http://localhost:5050/analyze/stream", {
+        method: "POST",
+        body: form,
       });
 
-      setConversations((list) =>
-        list.map((c) =>
-          c.id === convId
-            ? {
-                ...c,
-                status: "complete",
-                timeline: c.timeline.map((t) => ({ ...t, status: "done" as const })),
-                report: {
-                  fileName: file.name,
-                  permissionScore: score,
-                  highRisk,
-                  apiCalls,
-                  pipelineStatus,
-                  verdict,
-                  confidence,
-                  confidenceBreakdown: result.confidence_breakdown,
-                  executiveSummary: result.executive_summary,
-                  analystSummary: result.analyst_summary,
-                  recommendedActions: result.recommended_actions,
-                  mitreTechniques: result.mitre_techniques,
-                  agentFindings,
-                  correlations: result.correlations,
-                  analysisScope: result.analysis_scope,
-                  package: result.package,
-                },
-                messages: [
-                  ...c.messages,
-                  {
-                    id: newId(),
-                    role: "assistant",
-                    text: result.executive_summary
-                      ? `Analysis complete. ${result.executive_summary}`
-                      : `Analysis complete. Verdict: ${verdict}. ${highRisk.length} high-risk permissions detected. See report below — ask follow-ups anytime.`,
-                  },
-                ],
-              }
-            : c,
-        ),
-      );
+      if (!response.ok || !response.body) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error((errJson as { error?: string }).error ?? "Analysis failed");
+      }
+
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      // SSE parser: accumulate chunks, split on double-newline frames
+      const parseFrames = (chunk: string): Array<{ event: string; data: string }> => {
+        const frames: Array<{ event: string; data: string }> = [];
+        const rawFrames = chunk.split(/\n\n/);
+        for (const raw of rawFrames) {
+          if (!raw.trim()) continue;
+          let event = "message";
+          let data = "";
+          for (const line of raw.split(/\n/)) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data = line.slice(5).trim();
+          }
+          if (data) frames.push({ event, data });
+        }
+        return frames;
+      };
+
+      // Process SSE stream
+      while (!aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete frames (split on \n\n)
+        const splitIdx = buffer.lastIndexOf("\n\n");
+        if (splitIdx === -1) continue;
+        const complete = buffer.slice(0, splitIdx + 2);
+        buffer = buffer.slice(splitIdx + 2);
+
+        for (const { event, data } of parseFrames(complete)) {
+          // Keep-alive pings start with ":"
+          if (data === "" || event === "") continue;
+
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          // ---- Map SSE events to UI state ----
+          if (event === "tool_start") {
+            const label = (payload.label as string) || (payload.tool as string);
+            const stepId = payload.tool as string;
+            const agentId = payload.agent as string;
+            pushTimelineStep(label, stepId, "running");
+            if (agentId) setAgentStatus(agentId, "running");
+          }
+
+          else if (event === "tool_done") {
+            const stepId = payload.tool as string;
+            const agentId = payload.agent as string;
+            const summary = payload.summary as string | undefined;
+            pushTimelineStep("", stepId, "done");
+            // Only mark agent done when we have a summary (stays "running" until consensus)
+          }
+
+          else if (event === "planner_thinking") {
+            const stepId = `thinking-${payload.iteration}`;
+            pushTimelineStep("Agent reasoning…", stepId, "running");
+          }
+
+          else if (event === "planner_decision") {
+            const stepId = `thinking-${payload.iteration}`;
+            const reason = (payload.reason as string) || "Next step selected";
+            // Replace "thinking" step with the actual decision label
+            setConversations((list) =>
+              list.map((c) =>
+                c.id !== convId
+                  ? c
+                  : {
+                      ...c,
+                      timeline: c.timeline.map((t) =>
+                        t.id === stepId
+                          ? { ...t, label: reason.length > 60 ? reason.slice(0, 57) + "…" : reason, status: "done" as const }
+                          : t,
+                      ),
+                    },
+              ),
+            );
+            // Mark network agent running during planner calls (it handles threat intelligence)
+            setAgentStatus("network", "running");
+            setAgentStatus("threat", "running");
+          }
+
+          else if (event === "consensus_start") {
+            const stepId = "consensus";
+            pushTimelineStep("Generating verdict", stepId, "running");
+            setAgentStatus("consensus", "running");
+          }
+
+          else if (event === "result") {
+            // Final result — parse and build the report exactly like before
+            const result = payload as Record<string, unknown>;
+            markAllDone();
+
+            const highRisk: string[] = (result.high_risk_permissions as string[]) ?? [];
+            const score: number = (result.permission_score_percent as number) ?? 0;
+            const apiCalls = (result.api_calls as { api: string; description: string; file: string; is_library?: boolean }[]) ?? [];
+            const pipelineStatus = (result.pipeline_status as { apktool: { success: boolean; message: string }; jadx: { success: boolean; message: string }; sandbox: { success: boolean; message: string } }) ?? {
+              apktool: { success: false, message: "Not run" },
+              jadx: { success: false, message: "Not run" },
+              sandbox: { success: false, message: "Not run" },
+            };
+            const verdict = (result.verdict as "benign" | "suspicious" | "high-risk" | "malicious") ??
+              (score > 70 ? "high-risk" : score > 40 ? "suspicious" : "benign");
+            const confidence: number = (result.confidence as number) ?? Math.min(99, 60 + Math.round(score / 3));
+            const agentFindings = result.agent_findings as Record<string, AgentFinding> | undefined;
+
+            const fallbackSummaries: Record<string, string> = {
+              perm: `${highRisk.length} high-risk permissions`,
+              code: "Static scan complete",
+              behavior: "No anomalous runtime patterns",
+              network: "Outbound traffic profile captured",
+              threat: "Correlated against intel feeds",
+              consensus: `Verdict: ${verdict}`,
+            };
+            AGENT_TEMPLATE.forEach((a) => {
+              const finding = agentFindings?.[a.id];
+              setAgentStatus(a.id, "done", finding?.summary ?? fallbackSummaries[a.id]);
+            });
+
+            setConversations((list) =>
+              list.map((c) =>
+                c.id !== convId
+                  ? c
+                  : {
+                      ...c,
+                      status: "complete",
+                      timeline: c.timeline.map((t) => ({ ...t, status: "done" as const })),
+                      report: {
+                        fileName: file.name,
+                        permissionScore: score,
+                        highRisk,
+                        apiCalls,
+                        pipelineStatus,
+                        verdict,
+                        confidence,
+                        confidenceBreakdown: result.confidence_breakdown as string,
+                        executiveSummary: result.executive_summary as string,
+                        analystSummary: result.analyst_summary as string,
+                        recommendedActions: result.recommended_actions as string,
+                        mitreTechniques: result.mitre_techniques as string[],
+                        agentFindings,
+                        correlations: result.correlations as Correlation[],
+                        analysisScope: result.analysis_scope as "static_only" | "static_and_dynamic",
+                        package: result.package as string,
+                      },
+                      messages: [
+                        ...c.messages,
+                        {
+                          id: newId(),
+                          role: "assistant",
+                          text: result.executive_summary
+                            ? `Analysis complete. ${result.executive_summary as string}`
+                            : `Analysis complete. Verdict: ${verdict}. ${highRisk.length} high-risk permissions detected. See report below — ask follow-ups anytime.`,
+                        },
+                      ],
+                    },
+              ),
+            );
+            break; // stream is done
+          }
+
+          else if (event === "error") {
+            throw new Error((payload.message as string) ?? "Analysis failed");
+          }
+        }
+      }
     } catch (err) {
-      window.clearInterval(stepTimer);
-      agentTimers.forEach(clearTimeout);
+      aborted = true;
+      reader?.cancel().catch(() => {});
       setConversations((list) =>
         list.map((c) =>
-          c.id === convId
-            ? {
+          c.id !== convId
+            ? c
+            : {
                 ...c,
                 status: "error",
                 messages: [
@@ -343,18 +461,15 @@ export function Home() {
                   {
                     id: newId(),
                     role: "assistant",
-                    text:
-                      err instanceof Error
-                        ? `Analysis failed: ${err.message}`
-                        : "Analysis failed.",
+                    text: err instanceof Error ? `Analysis failed: ${err.message}` : "Analysis failed.",
                   },
                 ],
-              }
-            : c,
+              },
         ),
       );
     }
   };
+
 
   const submitChat = async () => {
     const text = input.trim();

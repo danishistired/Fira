@@ -15,6 +15,7 @@ The orchestrator:
 """
 
 import json
+from typing import Callable, Optional
 
 from engine.memory import InvestigationMemory
 from engine.planner import Planner
@@ -28,6 +29,32 @@ from shared.evidence import build_correlation_matrix
 # very_low=1, low=2, medium=4, high=6
 # A full investigation (manifest+perms+jadx+frida+monkey) costs ~18 units
 MAX_BUDGET = 30
+
+# Tool name -> friendly display label for SSE events
+TOOL_LABELS = {
+    "extract_manifest":  "Reading APK manifest",
+    "scan_permissions":  "Deep permission analysis",
+    "run_apktool":       "Scanning APK resources",
+    "run_jadx":          "Decompiling source code",
+    "run_frida":         "Running dynamic analysis",
+    "collect_logcat":    "Collecting system logs",
+    "run_monkey":        "Exercising UI code paths",
+    "capture_screenshot":"Capturing runtime screenshot",
+    "generate_report":   "Finalising verdict",
+}
+
+# Tool name -> which "agent" panel it feeds (for frontend status)
+TOOL_AGENT_MAP = {
+    "extract_manifest":  "perm",
+    "scan_permissions":  "perm",
+    "run_apktool":       "code",
+    "run_jadx":          "code",
+    "run_frida":         "behavior",
+    "collect_logcat":    "behavior",
+    "run_monkey":        "behavior",
+    "capture_screenshot":"behavior",
+    "generate_report":   "consensus",
+}
 
 
 class InvestigationOrchestrator:
@@ -43,25 +70,51 @@ class InvestigationOrchestrator:
         self.tools = tool_registry
         self.planner = Planner(llm_client)
 
-    def investigate(self, apk_path: str) -> dict:
+    def investigate(self, apk_path: str, emit: Optional[Callable[[str, dict], None]] = None) -> dict:
         """Run the full agentic investigation.
+
+        Args:
+            apk_path: Absolute path to the APK to investigate.
+            emit: Optional callback(event_type, data) for real-time progress.
+                  Called at: tool_start, tool_done, planner_reasoning,
+                             consensus_start, complete.
 
         Returns the same JSON shape as the old pipeline, plus new
         agentic fields (journal, hypotheses, confidence_history).
         """
+        def _emit(event: str, data: dict):
+            if emit:
+                try:
+                    emit(event, data)
+                except Exception:
+                    pass
         memory = InvestigationMemory(apk_path=apk_path)
 
         print(f"\n{'='*60}", flush=True)
         print(f"[Orchestrator] Starting agentic investigation: {apk_path}", flush=True)
+        _emit("status", {"phase": "starting", "message": "Investigation starting"})
 
         # ---- Step 1: Always extract manifest first ----
         memory.iteration = 1
         print(f"[Orchestrator] Iteration 1: extract_manifest (foundational)", flush=True)
+        _emit("tool_start", {
+            "tool": "extract_manifest",
+            "label": TOOL_LABELS["extract_manifest"],
+            "agent": TOOL_AGENT_MAP["extract_manifest"],
+            "iteration": 1,
+        })
         manifest_result = self.tools.execute("extract_manifest", apk_path=apk_path)
         memory.add_tool_result("extract_manifest", manifest_result)
         memory.record_budget_cost("very_low")
         memory.add_decision("extract_manifest", "Foundational step — manifest is always required",
                           manifest_result.get("summary", "Manifest extracted"))
+        _emit("tool_done", {
+            "tool": "extract_manifest",
+            "label": TOOL_LABELS["extract_manifest"],
+            "agent": TOOL_AGENT_MAP["extract_manifest"],
+            "summary": manifest_result.get("summary", "Manifest extracted"),
+            "success": manifest_result.get("success", False),
+        })
 
         # Record initial journal entry
         memory.add_journal_entry({
@@ -76,7 +129,7 @@ class InvestigationOrchestrator:
         # If no LLM available, fall back to fixed pipeline
         if not self.llm_client:
             print("[Orchestrator] No LLM client — falling back to fixed pipeline", flush=True)
-            return self._fallback_pipeline(memory)
+            return self._fallback_pipeline(memory, _emit)
 
         # ---- Step 2+: Agentic investigation loop ----
         MAX_ITERATIONS = 15  # Safety cap even with budget system
@@ -90,11 +143,30 @@ class InvestigationOrchestrator:
                 memory.status = "complete"
                 break
 
+            # Emit planner thinking event
+            _emit("planner_thinking", {
+                "iteration": iteration,
+                "message": "Agent reasoning about next step",
+                "budget_remaining": budget["budget_remaining"],
+                "coverage_percent": budget["coverage_percent"],
+            })
+
             # Ask the planner to reflect, reason, and decide
             decision = self.planner.decide(memory, self.tools)
             action = decision["action"]
             arguments = decision.get("arguments", {})
             reason = decision.get("reason", "")
+
+            # Emit the planner's reasoning
+            _emit("planner_decision", {
+                "iteration": iteration,
+                "action": action,
+                "reason": reason,
+                "confidence": decision.get("confidence"),
+                "hypotheses": [h.get("hypothesis", "") for h in decision.get("hypotheses", [])[:3]],
+                "knowledge_gaps": decision.get("knowledge_gaps", [])[:3],
+                "reflection": decision.get("reflection", ""),
+            })
 
             print(f"[Orchestrator] Iteration {iteration}: {action} — {reason}", flush=True)
 
@@ -104,6 +176,17 @@ class InvestigationOrchestrator:
                 memory.status = "complete"
                 break
 
+            # Emit tool starting
+            label = TOOL_LABELS.get(action, action)
+            agent = TOOL_AGENT_MAP.get(action, "")
+            _emit("tool_start", {
+                "tool": action,
+                "label": label,
+                "agent": agent,
+                "iteration": iteration,
+                "reason": reason,
+            })
+
             # Execute the tool
             result = self.tools.execute(action, **arguments)
             memory.add_tool_result(action, result)
@@ -112,6 +195,15 @@ class InvestigationOrchestrator:
             # Track budget cost from tool metadata
             tool_cost = self._get_tool_cost(action)
             memory.record_budget_cost(tool_cost)
+
+            # Emit tool done
+            _emit("tool_done", {
+                "tool": action,
+                "label": label,
+                "agent": agent,
+                "summary": result.get("summary", "Done"),
+                "success": result.get("success", False),
+            })
 
         else:
             print(f"[Orchestrator] Hit iteration cap ({MAX_ITERATIONS}). Forcing report.", flush=True)
@@ -123,10 +215,18 @@ class InvestigationOrchestrator:
         )
 
         # ---- Step 4: Generate consensus verdict via LLM ----
+        _emit("consensus_start", {"message": "Generating final verdict"})
         consensus = self._generate_consensus(memory)
 
         # ---- Step 5: Build response ----
-        return self._build_response(memory, consensus)
+        result = self._build_response(memory, consensus)
+        _emit("complete", {
+            "verdict": result.get("verdict"),
+            "confidence": result.get("confidence"),
+            "analysis_scope": result.get("analysis_scope"),
+            "iterations": memory.iteration,
+        })
+        return result
 
     def _get_tool_cost(self, tool_name: str) -> str:
         """Look up a tool's cost from its metadata."""
@@ -320,8 +420,10 @@ class InvestigationOrchestrator:
               f"hypotheses={len(memory.hypotheses)} journal={len(memory.journal)}", flush=True)
         return result
 
-    def _fallback_pipeline(self, memory: InvestigationMemory) -> dict:
+    def _fallback_pipeline(self, memory: InvestigationMemory, _emit=None) -> dict:
         """Fallback: run all tools in fixed order when no LLM is available."""
+        if _emit is None:
+            _emit = lambda e, d: None
         print("[Orchestrator] Running fallback pipeline (no LLM)...", flush=True)
 
         tools_to_run = [
@@ -333,14 +435,20 @@ class InvestigationOrchestrator:
 
         for tool_name, args in tools_to_run:
             memory.iteration += 1
+            label = TOOL_LABELS.get(tool_name, tool_name)
+            agent = TOOL_AGENT_MAP.get(tool_name, "")
+            _emit("tool_start", {"tool": tool_name, "label": label, "agent": agent, "iteration": memory.iteration})
             result = self.tools.execute(tool_name, **args)
             memory.add_tool_result(tool_name, result)
             memory.add_decision(tool_name, "Fallback pipeline — running all tools",
                               result.get("summary", "Done"))
+            _emit("tool_done", {"tool": tool_name, "label": label, "agent": agent, "summary": result.get("summary", "Done"), "success": result.get("success", False)})
 
         memory.status = "complete"
         memory.correlation_matrix = build_correlation_matrix(
             memory.api_calls, memory.raw_dynamic_logs, memory.sandbox_status
         )
 
-        return self._build_response(memory, None)
+        result = self._build_response(memory, None)
+        _emit("complete", {"verdict": result.get("verdict"), "confidence": result.get("confidence")})
+        return result
