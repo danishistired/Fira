@@ -1,0 +1,28 @@
+* [33mcdc0f04[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mfeature/phase-4[m[33m)[m ignore
+[31m|[m * [33m24e527a[m[33m ([m[1;31morigin/feature/phase-4[m[33m)[m ignore
+[31m|[m *   [33m02100cb[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Merge pull request #2 from danishistired/feature/phase-4
+[31m|[m [33m|[m[31m\[m  
+[31m|[m [33m|[m[31m/[m  
+[31m|[m[31m/[m[33m|[m   
+* [33m|[m [33me8db8e0[m feat: introduced YARA rules, RAG with MITRE ATT&CK vectors, OSINT Triage, VirusTotal and MalwareBazaar lookup. fixed the prompts, gonna optimise for cost later :) i promise
+[34m|[m *   [33md81aa7b[m Merge pull request #1 from danishistired/feature/architecture-change
+[34m|[m [35m|[m[34m\[m  
+[34m|[m [35m|[m[34m/[m  
+[34m|[m[34m/[m[35m|[m   
+* [35m|[m [33m2c0124e[m[33m ([m[1;31morigin/feature/architecture-change[m[33m, [m[1;32mfeature/architecture-change[m[33m)[m refactor: switched some models
+* [35m|[m [33m8fee243[m chore: add python bytecode cache files to analysis engine directory
+* [35m|[m [33m584a944[m feat: implement APK analysis dashboard with real-time SSE progress tracking and agent-based reporting
+* [35m|[m [33m281af6e[m feat: evolve planner into autonomous investigator with structured reasoning
+* [35m|[m [33mff6966e[m refactor: replace pipeline-driven architecture with agentic investigation engine
+[35m|[m[35m/[m  
+* [33m8f36e42[m[33m ([m[1;32mmain[m[33m)[m chore: add to-do.md to .gitignore
+* [33m2203869[m alright
+* [33m8987fae[m ignore again
+* [33m040e4b4[m sheeeeeeeeet
+* [33m1fc4a5b[m uhm fixed prompt? json parsoning error, new risk scoring formula, reduced noise being sent to the LLM, life good
+* [33md4a1773[m feat: implement dynamic analysis framework with Frida hooking and orchestration service
+* [33m23c8c33[m improved what we send to LLM
+* [33mb60c147[m feat: implement automated APK analysis backend with multi-agent LLM orchestration and sandboxing
+* [33m1dea618[m feat: implement APK analysis pipeline with automated tool downloader and Flask backend
+*   [33me98a0f3[m Redesigned workspace UI
+[1;31m|[m[1;32m\[m  
