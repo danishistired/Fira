@@ -38,6 +38,7 @@ analysis/out*/
 analysis/.env
 analysis/flask.log
 analysis/test_flask.log
+analysis/engine/__pycache__
 
 # Tools (downloaded separately)
 tools/
