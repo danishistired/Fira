@@ -20,6 +20,38 @@ from engine.memory import InvestigationMemory
 from engine.prompts import build_planner_system_prompt
 from shared.language import parse_llm_json, log_llm_prompt
 
+# RAG retriever — lazy import to avoid startup cost
+try:
+    from rag.retriever import retrieve_techniques, format_rag_context
+    _RAG_AVAILABLE = True
+except ImportError:
+    _RAG_AVAILABLE = False
+
+
+def _build_rag_query(memory: InvestigationMemory) -> str:
+    """Build a query string from current investigation evidence for RAG retrieval."""
+    parts = []
+    # High-signal API calls
+    for a in memory.api_calls:
+        if a.get("signal") in ("HIGH", "MEDIUM"):
+            parts.append(a.get("api", ""))
+    # High-risk permissions
+    for p in memory.high_risk_permissions[:5]:
+        parts.append(p.split(".")[-1])  # short name
+    # Hardcoded secrets types
+    for s in memory.hardcoded_secrets[:3]:
+        parts.append(s.get("type", ""))
+    # Runtime events
+    for e in memory.runtime_events[:5]:
+        parts.append(e.get("event_type", ""))
+    # OSINT family tags
+    vt = memory.osint.get("virustotal", {})
+    parts.extend(vt.get("family_tags", []))
+    mb = memory.osint.get("malwarebazaar", {})
+    if mb.get("malware_family"):
+        parts.append(mb["malware_family"])
+    return " ".join(p for p in parts if p).strip()
+
 
 class Planner:
     """DeepSeek-powered autonomous investigation planner.
@@ -39,9 +71,23 @@ class Planner:
         Also stores reflection, hypotheses, knowledge_gaps, confidence,
         and journal entry in memory.
         """
-        # Build the system prompt with tool descriptors + metadata
+        # Build the system prompt with tool descriptors + metadata + RAG context
         tool_descriptors = tool_registry.list_tools()
-        system_prompt = build_planner_system_prompt(tool_descriptors)
+
+        # Retrieve ATT&CK context from RAG
+        rag_context = ""
+        if _RAG_AVAILABLE:
+            try:
+                rag_query = _build_rag_query(memory)
+                if rag_query:
+                    techniques = retrieve_techniques(rag_query, n=5)
+                    rag_context = format_rag_context(techniques)
+                    if rag_context:
+                        print(f"[Planner] RAG: {len(techniques)} ATT&CK techniques retrieved", flush=True)
+            except Exception as e:
+                print(f"[Planner] RAG retrieval skipped: {e}", flush=True)
+
+        system_prompt = build_planner_system_prompt(tool_descriptors, rag_context=rag_context)
 
         # Build the user message with investigation state + budget
         investigation_state = memory.get_planner_summary()

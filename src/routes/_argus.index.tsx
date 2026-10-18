@@ -82,6 +82,26 @@ type Report = {
   correlations?: Correlation[];
   analysisScope?: "static_only" | "static_and_dynamic";
   package?: string;
+  osint?: {
+    virustotal?: {
+      found?: boolean;
+      skipped?: boolean;
+      detection_ratio?: number;
+      detection_count?: number;
+      engine_count?: number;
+      known_malicious?: boolean;
+      family_tags?: string[];
+      first_seen?: number;
+    };
+    malwarebazaar?: {
+      found?: boolean;
+      malware_family?: string;
+      bazaar_tags?: string[];
+      first_seen?: string;
+    };
+  };
+  yaraRule?: string;
+  yaraRuleName?: string;
 } | null;
 
 type Conversation = {
@@ -424,6 +444,9 @@ export function Home() {
                         correlations: result.correlations as Correlation[],
                         analysisScope: result.analysis_scope as "static_only" | "static_and_dynamic",
                         package: result.package as string,
+                        osint: result.osint as Report extends null ? never : NonNullable<Report>["osint"],
+                        yaraRule: result.yara_rule as string | undefined,
+                        yaraRuleName: result.yara_rule_name as string | undefined,
                       },
                       messages: [
                         ...c.messages,
@@ -1223,6 +1246,112 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
             {report.analystSummary}
           </div>
         </div>
+      )}
+
+      {/* ==================== OSINT TRIAGE ==================== */}
+      {report.osint && (
+        <div className="rounded-lg border border-cyan-500/10 bg-cyan-500/[0.02] p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400">OSINT Triage</span>
+            <span className="text-[11px] text-neutral-500">VirusTotal · MalwareBazaar</span>
+          </div>
+          <div className="space-y-3">
+            {/* VirusTotal */}
+            {report.osint.virustotal && (
+              <div className="rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-[12px] font-medium text-neutral-300">VirusTotal</span>
+                  {report.osint.virustotal.skipped ? (
+                    <Badge label="No API Key" variant="not-tested" />
+                  ) : report.osint.virustotal.found === false ? (
+                    <Badge label="Unknown Hash" variant="not-tested" />
+                  ) : report.osint.virustotal.known_malicious ? (
+                    <Badge label="Known Malicious" variant="high" />
+                  ) : (
+                    <Badge label="Clean" variant="observed" />
+                  )}
+                </div>
+                {report.osint.virustotal.found && !report.osint.virustotal.skipped && (
+                  <>
+                    <div className="mb-1 flex items-center gap-2">
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-neutral-800">
+                        <div
+                          className={`h-full rounded-full transition-all ${
+                            (report.osint.virustotal.detection_ratio ?? 0) > 0.5
+                              ? "bg-red-500"
+                              : (report.osint.virustotal.detection_ratio ?? 0) > 0.1
+                                ? "bg-amber-500"
+                                : "bg-emerald-500"
+                          }`}
+                          style={{ width: `${((report.osint.virustotal.detection_ratio ?? 0) * 100).toFixed(0)}%` }}
+                        />
+                      </div>
+                      <span className="shrink-0 font-mono text-[11px] text-neutral-400">
+                        {report.osint.virustotal.detection_count}/{report.osint.virustotal.engine_count} engines
+                      </span>
+                    </div>
+                    {report.osint.virustotal.family_tags && report.osint.virustotal.family_tags.length > 0 && (
+                      <div className="flex flex-wrap gap-1 pt-1">
+                        {report.osint.virustotal.family_tags.map((tag) => (
+                          <span key={tag} className="rounded border border-cyan-500/20 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] text-cyan-400">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+            {/* MalwareBazaar */}
+            {report.osint.malwarebazaar && (
+              <div className="rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-[12px] font-medium text-neutral-300">MalwareBazaar</span>
+                  {report.osint.malwarebazaar.found ? (
+                    <Badge label="Known Malware" variant="high" />
+                  ) : (
+                    <Badge label="Not Found" variant="not-tested" />
+                  )}
+                </div>
+                {report.osint.malwarebazaar.found && (
+                  <div className="mt-1 space-y-1 text-[12px]">
+                    {report.osint.malwarebazaar.malware_family && (
+                      <div><span className="text-neutral-500">Family: </span><span className="font-mono text-neutral-200">{report.osint.malwarebazaar.malware_family}</span></div>
+                    )}
+                    {report.osint.malwarebazaar.bazaar_tags && report.osint.malwarebazaar.bazaar_tags.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {report.osint.malwarebazaar.bazaar_tags.map((tag) => (
+                          <span key={tag} className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-400">{tag}</span>
+                        ))}
+                      </div>
+                    )}
+                    {report.osint.malwarebazaar.first_seen && (
+                      <div><span className="text-neutral-500">First seen: </span><span className="text-neutral-400">{report.osint.malwarebazaar.first_seen}</span></div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ==================== YARA RULE ==================== */}
+      {report.yaraRule && (
+        <Section title={`YARA Rule — ${report.yaraRuleName ?? "auto-generated"}`}>
+          <div className="relative">
+            <pre className="overflow-x-auto rounded-md border border-amber-500/10 bg-amber-500/[0.02] p-3 font-mono text-[11px] leading-5 text-amber-300/90">
+              {report.yaraRule}
+            </pre>
+            <button
+              onClick={() => { if (report.yaraRule) navigator.clipboard.writeText(report.yaraRule); }}
+              className="absolute right-2 top-2 rounded px-2 py-0.5 text-[10px] text-neutral-500 hover:bg-white/[0.06] hover:text-neutral-300"
+            >
+              copy
+            </button>
+          </div>
+        </Section>
       )}
     </motion.article>
   );

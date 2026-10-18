@@ -19,10 +19,20 @@ from typing import Callable, Optional
 
 from engine.memory import InvestigationMemory
 from engine.planner import Planner
-from engine.prompts import build_consensus_system_prompt
+from engine.prompts import build_consensus_system_prompt, MODEL_FAST
 from shared.language import parse_llm_json, enforce_language_on_findings, log_llm_prompt
 from shared.scoring import compute_risk_score
 from shared.evidence import build_correlation_matrix
+from tools.virustotal_tool import VirusTotalTool
+from tools.malwarebazaar_tool import MalwareBazaarTool
+from tools.yara_tool import YaraTool
+
+# Start RAG initialization in background so the first investigation doesn't wait
+try:
+    from rag.retriever import initialize_rag_background
+    initialize_rag_background()
+except Exception as _rag_err:
+    print(f"[Orchestrator] RAG init skipped: {_rag_err}", flush=True)
 
 
 # Maximum investigation budget (cost units, not iterations).
@@ -69,6 +79,9 @@ class InvestigationOrchestrator:
         self.llm_client = llm_client
         self.tools = tool_registry
         self.planner = Planner(llm_client)
+        self._vt_tool = VirusTotalTool()
+        self._mb_tool = MalwareBazaarTool()
+        self._yara_tool = YaraTool(llm_client)
 
     def investigate(self, apk_path: str, emit: Optional[Callable[[str, dict], None]] = None) -> dict:
         """Run the full agentic investigation.
@@ -93,6 +106,40 @@ class InvestigationOrchestrator:
         print(f"\n{'='*60}", flush=True)
         print(f"[Orchestrator] Starting agentic investigation: {apk_path}", flush=True)
         _emit("status", {"phase": "starting", "message": "Investigation starting"})
+
+        # ---- Step 0: OSINT Triage (VirusTotal + MalwareBazaar) ----
+        _emit("tool_start", {
+            "tool": "osint_triage",
+            "label": "OSINT reputation check",
+            "agent": "perm",
+            "iteration": 0,
+        })
+        vt_result = self._vt_tool.execute(apk_path=apk_path)
+        mb_result = self._mb_tool.execute(apk_path=apk_path)
+        memory.osint = {"virustotal": vt_result, "malwarebazaar": mb_result}
+
+        osint_summary_parts = []
+        if vt_result.get("summary"):
+            osint_summary_parts.append(f"VT: {vt_result['summary'][:80]}")
+        if mb_result.get("summary"):
+            osint_summary_parts.append(f"MB: {mb_result['summary'][:80]}")
+        osint_summary = " | ".join(osint_summary_parts) or "OSINT triage complete"
+
+        _emit("tool_done", {
+            "tool": "osint_triage",
+            "label": "OSINT reputation check",
+            "agent": "perm",
+            "summary": osint_summary,
+            "success": True,
+            "osint": {
+                "vt_detection_ratio": vt_result.get("detection_ratio"),
+                "vt_known_malicious": vt_result.get("known_malicious", False),
+                "vt_family_tags": vt_result.get("family_tags", []),
+                "mb_found": mb_result.get("found", False),
+                "mb_family": mb_result.get("malware_family"),
+            },
+        })
+        print(f"[Orchestrator] OSINT: {osint_summary}", flush=True)
 
         # ---- Step 1: Always extract manifest first ----
         memory.iteration = 1
@@ -220,13 +267,39 @@ class InvestigationOrchestrator:
 
         # ---- Step 5: Build response ----
         result = self._build_response(memory, consensus)
+
+        # ---- Step 6: YARA rule generation (malicious/high-risk only) ----
+        verdict = result.get("verdict", "")
+        if verdict in ("malicious", "high-risk", "suspicious") and self.llm_client:
+            _emit("status", {"phase": "yara", "message": "Generating YARA detection rule"})
+            yara_result = self._yara_tool.execute(
+                apk_path=apk_path,
+                investigation_summary={
+                    "api_calls": memory.api_calls,
+                    "hardcoded_secrets": memory.hardcoded_secrets,
+                    "package_name": memory.package_name,
+                    "manifest_vulnerabilities": memory.manifest_vulnerabilities,
+                    "verdict": verdict,
+                },
+            )
+            if yara_result.get("success"):
+                result["yara_rule"] = yara_result.get("yara_rule")
+                result["yara_rule_name"] = yara_result.get("rule_name")
+                print(f"[Orchestrator] YARA rule generated: {yara_result.get('rule_name')}", flush=True)
+
+        # Attach OSINT data to result
+        result["osint"] = memory.osint
+
         _emit("complete", {
             "verdict": result.get("verdict"),
             "confidence": result.get("confidence"),
             "analysis_scope": result.get("analysis_scope"),
             "iterations": memory.iteration,
+            "osint": memory.osint,
+            "yara_rule": result.get("yara_rule"),
         })
         return result
+
 
     def _get_tool_cost(self, tool_name: str) -> str:
         """Look up a tool's cost from its metadata."""

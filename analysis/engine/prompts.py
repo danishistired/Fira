@@ -19,9 +19,13 @@ MODEL_DECISION = "deepseek-reasoner"  # multi-step reasoning, large context
 MODEL_FAST = "deepseek-v4-flash"      # low-latency, single-turn tasks
 
 
-def build_planner_system_prompt(tool_descriptors: list[dict]) -> str:
+def build_planner_system_prompt(tool_descriptors: list[dict], rag_context: str = "") -> str:
     """Build the planner system prompt with tool descriptors + metadata.
 
+    Args:
+        tool_descriptors: List of tool descriptor dicts from the registry.
+        rag_context: Optional MITRE ATT&CK technique context from the RAG layer.
+                     Injected as a grounding block before the Decision Framework.
 
     The planner is an autonomous investigator. It reflects on evidence,
     maintains hypotheses, tracks knowledge gaps, and selects tools
@@ -47,6 +51,9 @@ def build_planner_system_prompt(tool_descriptors: list[dict]) -> str:
 
     tools_block = "\n".join(tool_lines)
 
+    # RAG block — inject threat intel context if available
+    rag_block = f"\n{rag_context}\n" if rag_context else ""
+
     return f"""You are the ARGUS Investigation Orchestrator — an autonomous Android malware analyst.
 
 You investigate APK files by dynamically selecting analysis tools based on accumulated evidence. You are an investigator who reasons about evidence, forms hypotheses, identifies knowledge gaps, and makes cost-aware decisions.
@@ -56,7 +63,7 @@ Determine the security posture of this APK while maximizing evidence quality and
 
 ## Available Tools (with metadata)
 {tools_block}
-
+{rag_block}
 ## Decision Framework
 For EVERY decision, you must reason through these steps:
 
