@@ -53,6 +53,9 @@ class InvestigationMemory:
         self.manifest_xml: str = ""
         self.correlation_matrix: list[dict] = []
 
+        # OSINT triage results (VirusTotal + MalwareBazaar)
+        self.osint: dict = {}
+
         # Investigation tracking
         self.decisions: list[dict] = []         # {iteration, action, reason, result_summary}
         self.tool_outputs: dict[str, dict] = {} # Raw tool outputs keyed by tool name
@@ -262,6 +265,31 @@ class InvestigationMemory:
         sections.append(f"Package: {self.package_name}")
         sections.append(f"Budget: {budget['budget_spent']}/{budget['budget_total']} units spent, "
                        f"{budget['budget_remaining']} remaining ({budget['coverage_percent']}% coverage)")
+
+        # 1a. OSINT triage results (highest priority — prepend before coverage)
+        if self.osint:
+            sections.append(f"\n## OSINT Triage")
+            vt = self.osint.get("virustotal", {})
+            mb = self.osint.get("malwarebazaar", {})
+            if vt.get("found"):
+                sections.append(
+                    f"- VirusTotal: {vt.get('detection_count',0)}/{vt.get('engine_count',1)} engines "
+                    f"({vt.get('detection_ratio',0)*100:.0f}% detection rate) "
+                    + ("⚠ KNOWN MALICIOUS" if vt.get('known_malicious') else "")
+                )
+                if vt.get('family_tags'):
+                    sections.append(f"  Tags: {', '.join(vt['family_tags'])}")
+            elif vt.get("skipped"):
+                sections.append(f"- VirusTotal: skipped (no API key)")
+            elif vt:
+                sections.append(f"- VirusTotal: hash not found in database")
+            if mb.get("found"):
+                sections.append(
+                    f"- MalwareBazaar: KNOWN MALWARE — family={mb.get('malware_family','unknown')}, "
+                    f"tags={mb.get('bazaar_tags', [])}"
+                )
+            elif mb:
+                sections.append(f"- MalwareBazaar: hash not found in database")
 
         # 2. Coverage report
         covered = [k for k, v in self.coverage.items() if v]

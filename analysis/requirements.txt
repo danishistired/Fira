@@ -13,3 +13,5 @@ xgboost
 catboost
 scikit-learn
 transformers
+chromadb
+requests
