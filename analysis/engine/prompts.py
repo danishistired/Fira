@@ -10,8 +10,18 @@ Three key prompts:
 """
 
 
+# ---------- Model Routing ----------
+# deepseek-reasoner (Pro)  → decision-heavy tasks: planner iterations + consensus verdict
+#   - Planner: deciding next investigation step, updating hypotheses across many tool outputs
+#   - Consensus: synthesising full investigation memory into a final verdict
+# deepseek-v4-flash         → normal tasks: conversational follow-up Q&A
+MODEL_DECISION = "deepseek-reasoner"  # multi-step reasoning, large context
+MODEL_FAST = "deepseek-v4-flash"      # low-latency, single-turn tasks
+
+
 def build_planner_system_prompt(tool_descriptors: list[dict]) -> str:
     """Build the planner system prompt with tool descriptors + metadata.
+
 
     The planner is an autonomous investigator. It reflects on evidence,
     maintains hypotheses, tracks knowledge gaps, and selects tools

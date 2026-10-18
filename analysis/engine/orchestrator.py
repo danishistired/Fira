@@ -314,10 +314,10 @@ class InvestigationOrchestrator:
 
                 print(f"[Orchestrator] Requesting consensus verdict (attempt {attempt})...", flush=True)
                 response = self.llm_client.chat.completions.create(
-                    model="deepseek-v4-flash",
+                    model="deepseek-reasoner",  # Pro: final verdict over full investigation memory
                     messages=messages,
                     temperature=0.2 + (attempt - 1) * 0.1,
-                    max_tokens=4096,
+                    max_tokens=8000,  # reasoner adds CoT before the JSON answer
                 )
                 raw = response.choices[0].message.content.strip()
                 print(f"[Orchestrator] Consensus received ({len(raw)} chars)", flush=True)

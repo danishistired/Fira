@@ -85,10 +85,10 @@ Reflect on the evidence, update your hypotheses, identify knowledge gaps, and de
                       f"(attempt {attempt}/{max_attempts})...", flush=True)
 
                 response = self.llm_client.chat.completions.create(
-                    model="deepseek-v4-flash",
+                    model="deepseek-reasoner",  # Pro: iterative hypothesis updates + multi-tool decision reasoning
                     messages=messages,
                     temperature=0.1 + (attempt - 1) * 0.1,
-                    max_tokens=1500,  # structured reasoning is longer
+                    max_tokens=8000,  # reasoner emits chain-of-thought before the JSON answer
                 )
 
                 raw = response.choices[0].message.content.strip()
