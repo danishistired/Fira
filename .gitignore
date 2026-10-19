@@ -38,7 +38,8 @@ analysis/out*/
 analysis/.env
 analysis/flask.log
 analysis/test_flask.log
-
+analysis/.frida-cache
+analysis/rag/chroma_data
 
 # Tools (downloaded separately)
 tools/
