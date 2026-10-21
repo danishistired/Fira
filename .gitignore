@@ -33,7 +33,8 @@ dist-ssr
 
 # Analysis backend
 analysis/.venv/
-analysis/__pycache__/
+__pycache__/
+*.pyc
 analysis/out*/
 analysis/.env
 analysis/flask.log
