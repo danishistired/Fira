@@ -443,7 +443,7 @@ def parse_network_flows(flows: list) -> dict:
         else:
             classification = "unknown"
 
-        classified.append(dict(**flow, classification=classification))
+        classified.append({**flow, "classification": classification})
 
     # Beaconing: host with >=3 POST to non-CDN/analytics
     c2_candidates = []

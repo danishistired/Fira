@@ -6,6 +6,7 @@ import frida
 import threading
 import lzma
 import urllib.request
+from pathlib import Path
 
 # Directory to cache frida-server downloads
 FRIDA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.frida-cache')
@@ -69,6 +70,106 @@ class SandboxOrchestrator:
         self.dynamic_logs = []
         self.is_running = False
         self._abort_event = threading.Event()  # set by timeout guard to stop session
+        self._bridge_source_cache = None        # cached bridges/java.js content
+
+    # ------------------------------------------------------------------
+    # Java bridge lazy-loading protocol
+    #
+    # The Frida CLI (frida -U -p <PID> -l script.js) does NOT load
+    # scripts directly.  Instead it loads ``repl_agent.js`` which sets
+    # up lazy getters for Java/ObjC/Swift on ``globalThis`` via
+    # ``Object.defineProperty``.  When ANY code accesses ``Java``
+    # (including ``typeof Java``), the getter fires, sends a
+    # ``frida:load-bridge`` message to the host, the host responds
+    # with the bridge source from ``bridges/java.js``, and the getter
+    # evaluates it — making ``Java`` available.
+    #
+    # Direct ``session.create_script()`` + ``script.load()`` calls
+    # (as ARGUS does) NEVER trigger this protocol, so ``Java`` is
+    # always ``undefined``.
+    #
+    # The methods below replicate the CLI's lazy-loading bridge
+    # protocol so that hooks.js can access the Java bridge.
+    # ------------------------------------------------------------------
+
+    def _get_bridge_source(self) -> str:
+        """Return the Java bridge source (``bridges/java.js`` from frida-tools)."""
+        if self._bridge_source_cache is not None:
+            return self._bridge_source_cache
+        try:
+            import frida_tools
+            bridge_path = Path(frida_tools.__file__).parent / "bridges" / "java.js"
+            self._bridge_source_cache = bridge_path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[Sandbox] WARNING: Could not read Java bridge source: {e}", flush=True)
+            self._bridge_source_cache = ""
+        return self._bridge_source_cache
+
+    def _build_bridge_loader_snippet(self) -> str:
+        """Return a JS snippet that sets up a lazy getter for ``Java`` on ``globalThis``.
+
+        On first access (including ``typeof Java``), the getter sends a
+        ``frida:load-bridge`` message to the host, waits for the bridge
+        source, evaluates it, and replaces itself with the real ``Java``
+        value — exactly like the Frida CLI's ``repl_agent.js``.
+        """
+        return """
+// --- ARGUS Java bridge lazy loader (mirrors frida-tools repl_agent.js) ---
+(function () {
+    var _bridge = null;
+    Object.defineProperty(globalThis, 'Java', {
+        get: function () {
+            if (_bridge !== null) return _bridge;
+            try {
+                send({"type": "frida:load-bridge", "name": "Java"});
+                var _payload = null;
+                recv("frida:bridge-loaded", function (r) { _payload = r; }).wait();
+                var wrapper = "(function () {\\n" +
+                    _payload.source + "\\n" +
+                    "Object.defineProperty(globalThis, 'Java', { value: bridge });\\n" +
+                    "return bridge;\\n" +
+                    "})();";
+                _bridge = eval(wrapper);
+                return _bridge;
+            } catch (e) {
+                return undefined;
+            }
+        },
+        configurable: true
+    });
+})();
+// --- end ARGUS bridge loader ---
+"""
+
+    def _handle_bridge_request(self, message: dict, script) -> bool:
+        """Handle ``frida:load-bridge`` messages from the lazy getter.
+
+        Returns True if the message was a bridge request (and was handled),
+        so callers can skip further processing.
+
+        Mirrors ``ConsoleApplication.try_handle_bridge_request()`` in
+        frida-tools ``application.py:951-972``.
+        """
+        if message.get("type") != "send":
+            return False
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("type") != "frida:load-bridge":
+            return False
+
+        name = payload.get("name", "").lower()
+        bridge_source = self._get_bridge_source()
+        if not bridge_source:
+            print(f"[Sandbox] WARNING: No bridge source available for '{name}'", flush=True)
+            return True  # claim we handled it to avoid cascading errors
+
+        script.post({
+            "type": "frida:bridge-loaded",
+            "filename": f"{name}.js",
+            "source": bridge_source,
+        })
+        return True
 
     def check_emulator(self):
         """Check if an Android emulator is connected via adb."""
@@ -370,10 +471,18 @@ class SandboxOrchestrator:
                         if 'Frida hooks injected successfully' in pdata:
                             java_ready.set()
 
-        # Now load hooks — Java runtime should be available
-        script_code = self._load_hooks_script()
+        # Now load hooks — prepend the Java bridge lazy loader so that
+        # the bridge is fetched on-demand (mirrors frida-tools CLI behavior).
+        script_code = self._build_bridge_loader_snippet() + self._load_hooks_script()
         script = session.create_script(script_code, runtime="v8")
-        script.on('message', _handshake_handler)
+
+        def _spawn_handler(message, data):
+            # Handle bridge requests FIRST (before any other processing)
+            if self._handle_bridge_request(message, script):
+                return
+            _handshake_handler(message, data)
+
+        script.on('message', _spawn_handler)
         script.load()
 
         # Wait for script to confirm it loaded (max 10s)
@@ -439,9 +548,15 @@ class SandboxOrchestrator:
                 session = self.device.attach(pid)
                 print(f"[Sandbox] Attached to PID {pid}")
 
-                script_code = self._load_hooks_script()
+                script_code = self._build_bridge_loader_snippet() + self._load_hooks_script()
                 script = session.create_script(script_code, runtime="v8")
-                script.on('message', self.on_frida_message)
+
+                def _retry_handler(message, data):
+                    if self._handle_bridge_request(message, script):
+                        return
+                    self.on_frida_message(message, data)
+
+                script.on('message', _retry_handler)
                 script.load()
 
                 return session
@@ -750,9 +865,15 @@ class SandboxOrchestrator:
         print(f"[Sandbox] Attached to PID {pid}", flush=True)
 
         # Load hooks — Java VM is already running so hooks should inject immediately
-        script_code = self._load_hooks_script()
+        script_code = self._build_bridge_loader_snippet() + self._load_hooks_script()
         script = session.create_script(script_code, runtime="v8")
-        script.on('message', self.on_frida_message)
+
+        def _launch_handler(message, data):
+            if self._handle_bridge_request(message, script):
+                return
+            self.on_frida_message(message, data)
+
+        script.on('message', _launch_handler)
         script.load()
 
         # Wait briefly for Java hooks to confirm
