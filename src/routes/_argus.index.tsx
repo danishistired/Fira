@@ -115,6 +115,7 @@ type Conversation = {
   report: Report;
   status: "idle" | "analyzing" | "complete" | "error";
   currentFile?: string;
+  jobId?: string;  // Phase 3: backend job UUID
 };
 
 // ---------- defaults ----------
@@ -387,6 +388,16 @@ export function Home() {
             const stepId = "consensus";
             pushTimelineStep("Generating verdict", stepId, "running");
             setAgentStatus("consensus", "running");
+          }
+
+          else if (event === "status") {
+            // First event carries job_id from Phase 3 backend
+            const serverJobId = payload.job_id as string | undefined;
+            if (serverJobId) {
+              setConversations((list) =>
+                list.map((c) => c.id === convId ? { ...c, jobId: serverJobId } : c)
+              );
+            }
           }
 
           else if (event === "result") {

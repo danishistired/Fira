@@ -1,21 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
-  Link,
   createRootRouteWithContext,
   useRouter,
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
-import { Home } from "./_argus.index";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
-
-function NotFoundComponent() {
-  return <Home />;
-}
 
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   const router = useRouter();
@@ -23,8 +17,13 @@ function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="max-w-md text-center">
-        <h1 className="text-xl font-semibold">Something went wrong</h1>
-        <button onClick={() => { router.invalidate(); reset(); }} className="mt-4 rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground">Retry</button>
+        <h1 className="text-xl font-semibold text-foreground">Something went wrong</h1>
+        <button
+          onClick={() => { router.invalidate(); reset(); }}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground"
+        >
+          Retry
+        </button>
       </div>
     </div>
   );
@@ -36,7 +35,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "ARGUS — GenAI Malware Intelligence" },
-      { name: "description", content: "Multi-agent APK malware analysis command center." },
+      { name: "description", content: "Multi-agent APK malware analysis powered by AI." },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
@@ -47,7 +46,8 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   }),
   shellComponent: RootShell,
   component: RootComponent,
-  notFoundComponent: NotFoundComponent,
+  // Any unknown URL falls back to the root which the router redirects to /
+  notFoundComponent: () => null,
   errorComponent: ErrorComponent,
 });
 

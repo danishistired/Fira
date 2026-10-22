@@ -1,15 +1,9 @@
-import { createFileRoute, Outlet, useRouterState } from "@tanstack/react-router";
-import { Home as HomePage } from "./_argus.index";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/_argus")({
-  component: ArgusLayout,
-});
-
-function ArgusLayout() {
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
-  return (
+  component: () => (
     <div className="min-h-screen bg-background text-foreground antialiased">
-      {pathname === "/" ? <HomePage /> : <Outlet />}
+      <Outlet />
     </div>
-  );
-}
+  ),
+});

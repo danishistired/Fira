@@ -146,3 +146,17 @@
   to { stroke-dashoffset: -20; }
 }
 .flow-line { stroke-dasharray: 4 6; animation: flow 1.2s linear infinite; }
+
+/* Print / PDF export styles */
+@media print {
+  .print\:hidden { display: none !important; }
+  aside, header { display: none !important; }
+  .ml-\[240px\] { margin-left: 0 !important; }
+  body { background: white; color: black; }
+  body::before { display: none; }
+  .glass { background: white; border: 1px solid #e5e7eb; }
+  .border-border { border-color: #e5e7eb; }
+  .bg-card, .bg-surface { background: #f9fafb; }
+  .text-foreground { color: #111827; }
+  .text-muted-foreground { color: #6b7280; }
+}

@@ -120,7 +120,7 @@ Introduce a lightweight but real persistence layer so jobs, findings, and eviden
 ---
 
 ## Phase 4 — Frontend as a Real Product Surface
-**Status: 🔶 Partial — Core upload/result page works; all other routes are disabled placeholders.**
+**Status: ✅ Done**
 
 ### Scope
 Either restore the disabled pages as real, data-backed views or remove them cleanly. The UI must match the actual backend capabilities at every route.
