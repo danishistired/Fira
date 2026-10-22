@@ -42,28 +42,32 @@ MAX_BUDGET = 30
 
 # Tool name -> friendly display label for SSE events
 TOOL_LABELS = {
-    "extract_manifest":  "Reading APK manifest",
-    "scan_permissions":  "Deep permission analysis",
-    "run_apktool":       "Scanning APK resources",
-    "run_jadx":          "Decompiling source code",
-    "run_frida":         "Running dynamic analysis",
-    "collect_logcat":    "Collecting system logs",
-    "run_monkey":        "Exercising UI code paths",
-    "capture_screenshot":"Capturing runtime screenshot",
-    "generate_report":   "Finalising verdict",
+    "extract_manifest":       "Reading APK manifest",
+    "scan_permissions":       "Deep permission analysis",
+    "run_apktool":            "Scanning APK resources",
+    "run_jadx":               "Decompiling source code",
+    "run_frida":              "Running dynamic analysis",
+    "collect_logcat":         "Collecting system logs",
+    "run_monkey":             "Exercising UI code paths",
+    "capture_screenshot":     "Capturing runtime screenshot",
+    "run_mobsf":              "MobSF independent analysis",
+    "capture_network_traffic":"Capturing network traffic",
+    "generate_report":        "Finalising verdict",
 }
 
 # Tool name -> which "agent" panel it feeds (for frontend status)
 TOOL_AGENT_MAP = {
-    "extract_manifest":  "perm",
-    "scan_permissions":  "perm",
-    "run_apktool":       "code",
-    "run_jadx":          "code",
-    "run_frida":         "behavior",
-    "collect_logcat":    "behavior",
-    "run_monkey":        "behavior",
-    "capture_screenshot":"behavior",
-    "generate_report":   "consensus",
+    "extract_manifest":       "perm",
+    "scan_permissions":       "perm",
+    "run_apktool":            "code",
+    "run_jadx":               "code",
+    "run_frida":              "behavior",
+    "collect_logcat":         "behavior",
+    "run_monkey":             "behavior",
+    "capture_screenshot":     "behavior",
+    "run_mobsf":              "code",
+    "capture_network_traffic":"network",
+    "generate_report":        "consensus",
 }
 
 

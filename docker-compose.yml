@@ -5,3 +5,11 @@ services:
       - "5000:5000"
     volumes:
       - ./analysis:/app
+
+  mobsf:
+    image: opensecurity/mobile-security-framework-mobsf:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - MOBSF_API_KEY=argus_mobsf_key_12345
+

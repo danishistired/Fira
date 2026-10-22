@@ -10,11 +10,17 @@ import urllib.request
 # Directory to cache frida-server downloads
 FRIDA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.frida-cache')
 
+# Maximum wall-clock seconds any dynamic analysis session may run.
+# A threading.Timer kills the session if it exceeds this regardless of
+# what the caller requested — prevents runaway APKs from blocking the queue.
+DYNAMIC_ANALYSIS_TIMEOUT = int(os.environ.get("ARGUS_DYNAMIC_TIMEOUT", "120"))
+
 class SandboxOrchestrator:
     def __init__(self):
         self.device = None
         self.dynamic_logs = []
         self.is_running = False
+        self._abort_event = threading.Event()  # set by timeout guard to stop session
 
     def check_emulator(self):
         """Check if an Android emulator is connected via adb."""
@@ -34,6 +40,41 @@ class SandboxOrchestrator:
         except Exception as e:
             print(f"[Sandbox] ADB check failed: {e}")
             return False
+
+    def wait_for_emulator_ready(self, timeout: int = 30) -> bool:
+        """Poll sys.boot_completed until the emulator is fully booted."""
+        print(f"[Sandbox] Waiting up to {timeout}s for emulator to be ready...", flush=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(
+                    ["adb", "shell", "getprop", "sys.boot_completed"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.stdout.strip() == "1":
+                    print("[Sandbox] Emulator is fully booted.", flush=True)
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        print("[Sandbox] Emulator boot timeout.", flush=True)
+        return False
+
+    def cleanup_app_state(self, package_name: str):
+        """Clear app data and cache before a fresh dynamic run.
+        
+        This ensures each analysis starts from a clean slate so
+        previous runs don't pollute the state (e.g., cached prefs,
+        activation flags, or previously established C2 sessions).
+        """
+        print(f"[Sandbox] Clearing app data for {package_name}...", flush=True)
+        try:
+            subprocess.run(
+                ["adb", "shell", "pm", "clear", package_name],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            print(f"[Sandbox] App state clear failed (non-fatal): {e}", flush=True)
 
     def _get_device_arch(self):
         """Get the CPU architecture of the connected device/emulator."""
@@ -309,8 +350,13 @@ class SandboxOrchestrator:
         return session
 
     def run_dynamic_analysis(self, package_name, apk_path, duration_seconds=30):
-        """Orchestrates the dynamic analysis phase."""
+        """Orchestrates the dynamic analysis phase with lifecycle management.
+        
+        A global timeout guard (DYNAMIC_ANALYSIS_TIMEOUT) prevents runaway
+        APKs from blocking the analysis queue indefinitely.
+        """
         self.dynamic_logs = []
+        self._abort_event.clear()
 
         if not self.check_emulator():
             return {"success": False, "error": "No emulator connected", "logs": []}
@@ -318,9 +364,26 @@ class SandboxOrchestrator:
         # 0. Ensure frida-server is running on the device
         self.ensure_frida_server()
 
+        # 0b. Clear previous app state for reproducibility
+        self.cleanup_app_state(package_name)
+
         # 1. Install
         if not self.install_apk(apk_path):
             return {"success": False, "error": "Failed to install APK", "logs": []}
+
+        # Start global watchdog — kills session if it exceeds the hard cap
+        effective_timeout = min(duration_seconds + 30, DYNAMIC_ANALYSIS_TIMEOUT)
+        watchdog_fired = threading.Event()
+
+        def _watchdog():
+            print(f"[Sandbox] WATCHDOG: session exceeded {effective_timeout}s — forcing abort", flush=True)
+            self.dynamic_logs.append(f"WATCHDOG: analysis killed after {effective_timeout}s")
+            self._abort_event.set()
+            watchdog_fired.set()
+
+        watchdog = threading.Timer(effective_timeout, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
 
         # 2. Instrument & monitor
         session = None
@@ -341,6 +404,8 @@ class SandboxOrchestrator:
                 print(f"[Sandbox] Frida Error: {e}")
                 self.dynamic_logs.append(f"Sandbox Error: {e}")
         finally:
+            # Cancel watchdog (if it hasn't already fired)
+            watchdog.cancel()
             # Cleanup
             if session:
                 try:
@@ -349,9 +414,11 @@ class SandboxOrchestrator:
                     pass
             self.uninstall_apk(package_name)
 
+        timed_out = watchdog_fired.is_set()
         return {
-            "success": True,
-            "logs": self.dynamic_logs
+            "success": not timed_out,
+            "timed_out": timed_out,
+            "logs": self.dynamic_logs,
         }
 
 if __name__ == "__main__":

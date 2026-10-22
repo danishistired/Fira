@@ -59,6 +59,7 @@ load_dotenv(os.path.join(ANALYSIS_DIR, '.env'))
 logging.getLogger('androguard').setLevel(logging.WARNING)
 
 from engine.orchestrator import InvestigationOrchestrator
+from engine.dynamic_only_orchestrator import DynamicOnlyOrchestrator
 from tools.registry import ToolRegistry
 from shared.language import enforce_language_rules, log_llm_prompt
 from pathlib import Path
@@ -100,6 +101,7 @@ else:
 registry = ToolRegistry()
 registry.auto_register()
 orchestrator = InvestigationOrchestrator(llm_client, registry)
+dynamic_orchestrator = DynamicOnlyOrchestrator(llm_client, registry)
 
 print(f"[INIT] ARGUS agentic engine initialized with {len(registry.list_tool_names())} tools", flush=True)
 print(f"[INIT] Available tools: {', '.join(registry.list_tool_names())}", flush=True)
@@ -224,6 +226,9 @@ def analyze_apk_stream():
     if f.filename == '':
         return jsonify({'error': 'empty filename'}), 400
 
+    # Read analysis mode from form data
+    analysis_mode = request.form.get("mode", "full")  # 'full' or 'dynamic_only'
+
     # Save to temp file before streaming starts
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk')
     os.close(tmp_fd)
@@ -252,7 +257,10 @@ def analyze_apk_stream():
     def run_investigation():
         try:
             update_job_status(job_id, "running")
-            result = orchestrator.investigate(tmp_path, emit=emit)
+            # Route to appropriate orchestrator based on mode
+            active_orchestrator = dynamic_orchestrator if analysis_mode == "dynamic_only" else orchestrator
+            print(f"[App] Analysis mode: {analysis_mode} -> {active_orchestrator.__class__.__name__}", flush=True)
+            result = active_orchestrator.investigate(tmp_path, emit=emit)
 
             # -- Phase 3: persist full result --
             update_job_result(job_id, result)

@@ -376,3 +376,112 @@ def build_correlation_matrix(api_calls, dynamic_logs, sandbox_status):
           f"{not_tested_count} not tested", flush=True)
 
     return correlations
+
+
+# ======================================================
+# Phase 2: Network flow analysis
+# ======================================================
+
+_BENIGN_DOMAIN_SUFFIXES = (
+    ".googleapis.com", ".gstatic.com", ".google.com", ".firebase.io",
+    ".firebaseio.com", ".firebaseapp.com", ".cloudflare.com", ".fastly.net",
+    ".akamaized.net", ".amazonaws.com", ".cloudfront.net",
+    ".crashlytics.com", ".fabric.io", ".applovin.com", ".admob.com",
+    ".doubleclick.net", ".facebook.com", ".instagram.com",
+    ".apple.com", ".icloud.com", ".microsoft.com",
+)
+
+_ANALYTICS_TOKENS = (
+    "analytics", "telemetry", "metrics", "stats", "tracking",
+    "adjust.com", "appsflyer.com", "branch.io", "segment.io",
+)
+
+_SUSPICIOUS_HOST_RE = re.compile(
+    r"(\d{1,3}\.){3}\d{1,3}"
+    r"|dyn\.?dns|no-?ip\.org|freedns"
+    r"|pastebin\.com|hastebin\.com"
+    r"|\.onion$",
+    re.IGNORECASE,
+)
+
+
+def parse_network_flows(flows: list) -> dict:
+    """Classify raw network flow objects from the NetworkCaptureTool.
+
+    Tags each flow as cdn / analytics / c2_beacon / suspicious / unknown.
+    Detects beaconing via repeated POST to non-CDN hosts (>=3 calls).
+    Returns classified flows, suspicious highlights, and analyst summary.
+    """
+    if not flows:
+        return {
+            "classified_flows": [],
+            "suspicious_flows": [],
+            "c2_candidates": [],
+            "unique_domains": [],
+            "unique_ips": [],
+            "summary": "No network flows captured.",
+        }
+
+    classified = []
+    host_freq = {}
+
+    for flow in flows:
+        host = flow.get("host", "")
+        if not host:
+            continue
+        method = flow.get("method", "GET")
+        ts = flow.get("timestamp", "")
+        host_freq.setdefault(host, []).append((method, ts))
+
+        host_lower = host.lower()
+        if any(host_lower.endswith(sfx) for sfx in _BENIGN_DOMAIN_SUFFIXES):
+            classification = "cdn"
+        elif any(token in host_lower for token in _ANALYTICS_TOKENS):
+            classification = "analytics"
+        elif _SUSPICIOUS_HOST_RE.search(host):
+            classification = "suspicious"
+        else:
+            classification = "unknown"
+
+        classified.append(dict(**flow, classification=classification))
+
+    # Beaconing: host with >=3 POST to non-CDN/analytics
+    c2_candidates = []
+    for host, calls in host_freq.items():
+        posts = [c for c in calls if c[0] == "POST"]
+        h = host.lower()
+        is_benign = (
+            any(h.endswith(sfx) for sfx in _BENIGN_DOMAIN_SUFFIXES)
+            or any(tok in h for tok in _ANALYTICS_TOKENS)
+        )
+        if len(posts) >= 3 and not is_benign:
+            c2_candidates.append({
+                "host": host,
+                "post_count": len(posts),
+                "verdict": "potential_c2_beacon",
+                "detail": f"{len(posts)} POST requests to non-CDN host - possible C2 beaconing",
+            })
+            for f in classified:
+                if f.get("host") == host:
+                    f["classification"] = "c2_beacon"
+
+    suspicious_flows = [f for f in classified if f["classification"] in ("suspicious", "c2_beacon")]
+    unique_domains = sorted({f["host"] for f in classified if not re.match(r"^\d", f.get("host", ""))})
+    unique_ips = sorted({f["host"] for f in classified if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", f.get("host", ""))})
+
+    parts = [f"Analysed {len(classified)} network flows."]
+    if c2_candidates:
+        parts.append(f"{len(c2_candidates)} potential C2 beacon hosts: {', '.join(x['host'] for x in c2_candidates[:3])}.")
+    if unique_ips:
+        parts.append(f"Raw IP connections (DNS-bypass): {', '.join(unique_ips[:5])}.")
+    if not suspicious_flows and not c2_candidates and not unique_ips:
+        parts.append("No suspicious network destinations identified.")
+
+    return {
+        "classified_flows": classified[:50],
+        "suspicious_flows": suspicious_flows[:20],
+        "c2_candidates": c2_candidates,
+        "unique_domains": unique_domains[:30],
+        "unique_ips": unique_ips[:20],
+        "summary": " ".join(parts),
+    }

@@ -53,6 +53,11 @@ class InvestigationMemory:
         self.manifest_xml: str = ""
         self.correlation_matrix: list[dict] = []
 
+        # Phase 2: Dynamic analysis evidence buckets
+        self.mobsf_findings: dict = {}           # MobSF report findings
+        self.network_flows: list[dict] = []      # Classified network flows from mitmproxy
+        self.network_analysis: dict = {}         # parse_network_flows() output
+
         # OSINT triage results (VirusTotal + MalwareBazaar)
         self.osint: dict = {}
 
@@ -72,6 +77,8 @@ class InvestigationMemory:
             "runtime_monkey": False,
             "logcat": False,
             "screenshot": False,
+            "mobsf": False,              # Phase 2
+            "network_capture": False,    # Phase 2
         }
 
         # Sandbox status (for backward compatibility)
@@ -130,6 +137,10 @@ class InvestigationMemory:
             self.coverage["logcat"] = True
         elif tool_name == "capture_screenshot":
             self.coverage["screenshot"] = True
+        elif tool_name == "run_mobsf":
+            self._ingest_mobsf(result)
+        elif tool_name == "capture_network_traffic":
+            self._ingest_network_flows(result)
 
         print(f"[Memory] Ingested {tool_name} result. Coverage: "
               f"{sum(self.coverage.values())}/{len(self.coverage)}", flush=True)
@@ -166,6 +177,42 @@ class InvestigationMemory:
         self.coverage["runtime_frida"] = True
         if result.get("success"):
             self.sandbox_status = {"success": True, "message": "Sandbox execution complete"}
+
+    def _ingest_mobsf(self, result: dict):
+        """Extract MobSF report findings into memory."""
+        if result.get("skipped"):
+            print("[Memory] MobSF skipped (not configured)", flush=True)
+            return
+        self.mobsf_findings = {
+            "score": result.get("mobsf_score"),
+            "api_abuse": result.get("api_abuse", []),
+            "certificate_issues": result.get("certificate_issues", []),
+            "hardcoded_secrets": result.get("hardcoded_secrets", []),
+            "manifest_issues": result.get("manifest_issues", []),
+            "malware_checks": result.get("malware_checks", []),
+        }
+        # Merge MobSF hardcoded secrets into the main secrets bucket
+        for secret in result.get("hardcoded_secrets", []):
+            if secret not in self.hardcoded_secrets:
+                self.hardcoded_secrets.append(secret)
+        self.coverage["mobsf"] = True
+        print(f"[Memory] MobSF findings ingested. Score: {result.get('mobsf_score')}", flush=True)
+
+    def _ingest_network_flows(self, result: dict):
+        """Extract and classify captured network flows."""
+        if result.get("skipped"):
+            print("[Memory] Network capture skipped", flush=True)
+            return
+        from shared.evidence import parse_network_flows
+        raw_flows = result.get("flows", [])
+        self.network_flows = raw_flows
+        self.network_analysis = parse_network_flows(raw_flows)
+        self.coverage["network_capture"] = True
+        c2_count = len(self.network_analysis.get("c2_candidates", []))
+        if c2_count:
+            print(f"[Memory] Network capture: {c2_count} potential C2 beaconing hosts", flush=True)
+        else:
+            print(f"[Memory] Network capture: {len(raw_flows)} flows, no C2 candidates", flush=True)
 
     def add_decision(self, action: str, reason: str, result_summary: str):
         """Record a planner decision for the investigation timeline."""

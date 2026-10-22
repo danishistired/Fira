@@ -13,6 +13,8 @@ import {
   ChevronDown,
   Hexagon,
   Trash2,
+  Zap,
+  Shield,
 } from "lucide-react";
 
 export const Route = createFileRoute("/_argus/")({
@@ -186,6 +188,7 @@ export function Home() {
   }, [activeId, isMounted]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [input, setInput] = useState("");
+  const [dynamicOnlyMode, setDynamicOnlyMode] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -280,6 +283,7 @@ export function Home() {
     // Use FormData + fetch to upload, then parse SSE from the response body
     const form = new FormData();
     form.append("file", file);
+    form.append("mode", dynamicOnlyMode ? "dynamic_only" : "full");
 
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let aborted = false;
@@ -712,6 +716,33 @@ export function Home() {
         {/* Composer */}
         <div className="w-full shrink-0 border-t border-white/[0.06] bg-[#0a0a0c]/95 backdrop-blur">
           <div className="mx-auto w-full max-w-3xl px-6 py-4">
+
+            {/* Dynamic-only mode toggle */}
+            <div className="mb-2.5 flex items-center gap-2">
+              <button
+                id="dynamic-mode-toggle"
+                onClick={() => setDynamicOnlyMode((v) => !v)}
+                title={dynamicOnlyMode ? "Switch to Full Analysis" : "Switch to Dynamic Analysis Only"}
+                className={`group flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium transition-all duration-200 ${
+                  dynamicOnlyMode
+                    ? "border-amber-500/40 bg-amber-500/10 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.15)]"
+                    : "border-white/[0.07] bg-white/[0.02] text-neutral-500 hover:border-white/[0.12] hover:text-neutral-300"
+                }`}
+              >
+                {dynamicOnlyMode ? (
+                  <Zap size={11} strokeWidth={2} className="text-amber-400" />
+                ) : (
+                  <Shield size={11} strokeWidth={1.5} />
+                )}
+                {dynamicOnlyMode ? "Dynamic Only" : "Full Analysis"}
+              </button>
+              {dynamicOnlyMode && (
+                <span className="text-[10px] text-amber-500/70">
+                  ⚡ Requires connected emulator · Skips static analysis
+                </span>
+              )}
+            </div>
+
             <div className="flex items-end gap-2 rounded-xl border border-white/[0.08] bg-[#101014] px-3 py-2.5 focus-within:border-white/20">
               <button
                 onClick={() => fileRef.current?.click()}
