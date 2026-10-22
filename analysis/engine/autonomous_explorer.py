@@ -30,11 +30,12 @@ from shared.language import parse_llm_json, log_llm_prompt
 
 
 # ---- Exploration budget defaults ----
-DEFAULT_MAX_STEPS = 50
-DEFAULT_MAX_SECONDS = 300       # 5 minutes
+DEFAULT_MAX_STEPS = 25
+DEFAULT_MAX_SECONDS = 90        # 1.5 minutes — most apps exhaust paths quickly
 DEFAULT_STEP_SETTLE = 0.8       # seconds to wait after each action
-UI_STALL_LIMIT = 4               # same screen N times in a row → done
-LLM_MAX_FAILURES = 8             # consecutive LLM parse failures → fallback
+UI_STALL_LIMIT = 3               # same screen N times in a row → done
+LLM_MAX_FAILURES = 3             # consecutive LLM parse failures → fallback
+BOREDOM_LIMIT = 5                # steps with nothing new → auto-stop
 APP_RELAUNCH_ATTEMPTS = 5        # crash recovery retries
 RELAUNCH_COOLDOWN = 3.0          # min seconds between relaunches
 
@@ -131,6 +132,13 @@ class AutonomousExplorer:
         self._dismissed_dialog_counts: dict[str, int] = {}
         # Anti-storm: minimum interval between relaunches
         self._last_relaunch_time = 0.0
+        # Boredom detection — auto-stop when nothing new happens
+        self._steps_since_new_screen = 0
+        self._steps_since_frida_event = 0
+        self._steps_since_new_elements = 0
+        self._prev_element_sig = ""
+        # Fallback tracking — avoid back-press loops
+        self._fallback_consecutive = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,6 +165,9 @@ class AutonomousExplorer:
 
         # Re-launch the app to ensure it's in the foreground
         self._launch_app()
+
+        # Clear logcat so we only capture fresh toasts/feedback from this session
+        self._clear_logcat()
 
         # ---- Pre-flight: dismiss system dialogs (compat warnings, etc.) ----
         for _ in range(5):
@@ -229,7 +240,6 @@ class AutonomousExplorer:
 
         # ---- Stall detection ----
         from shared.ui_simplifier import hash_ui_signature
-        # We need UIElement objects for hashing — parse them from elements dicts
         sig = _hash_element_dicts(elements)
         self._ui_hashes.append(sig)
         if len(self._ui_hashes) > self._cfg.stall_limit:
@@ -241,14 +251,45 @@ class AutonomousExplorer:
             self._stop_reason = "ui_stall"
             return False
 
+        # ---- Boredom detection — track novelty ----
+        is_new_screen = screen_key and screen_key not in self._screens_seen
+        if is_new_screen:
+            self._steps_since_new_screen = 0
+        else:
+            self._steps_since_new_screen += 1
+
+        # Track element novelty (top-3 element signatures)
+        curr_sig = _hash_element_dicts(elements)
+        if curr_sig != self._prev_element_sig:
+            self._steps_since_new_elements = 0
+            self._prev_element_sig = curr_sig
+        else:
+            self._steps_since_new_elements += 1
 
         # ---- Collect Frida events ----
         new_frida_events: list[str] = []
         if self._frida:
             new_frida_events = self._frida.poll_new_logs()
 
+        if new_frida_events:
+            self._steps_since_frida_event = 0
+        else:
+            self._steps_since_frida_event += 1
+
+        # ---- Boredom check — all three stale → stop ----
+        if (
+            self._steps_since_new_screen >= BOREDOM_LIMIT
+            and self._steps_since_frida_event >= BOREDOM_LIMIT
+            and self._steps_since_new_elements >= BOREDOM_LIMIT
+        ):
+            self._stop_reason = "nothing_new"
+            return False
+
+        # ---- Poll logcat for toast/popup feedback ----
+        logcat_feedback = self._poll_logcat_feedback()
+
         # ---- Decide ----
-        decision = self._decide(ui_text, elements, screen, new_frida_events, elapsed)
+        decision = self._decide(ui_text, elements, screen, new_frida_events, elapsed, logcat_feedback)
 
         # ---- Handle done ----
         if decision.get("action") == "done" or decision.get("done"):
@@ -292,6 +333,7 @@ class AutonomousExplorer:
         screen: dict,
         new_frida_events: list[str],
         elapsed: float,
+        logcat_feedback: list[str] | None = None,
     ) -> dict:
         """Ask the LLM what to do next.  Returns a validated decision dict."""
         # Build user message
@@ -300,6 +342,12 @@ class AutonomousExplorer:
             f"Elapsed {int(elapsed)}s/{self._cfg.max_seconds}s",
         ]
 
+        # Logcat feedback (app toasts/popups — invisible to UI dump)
+        if logcat_feedback:
+            user_parts.append(f"\n## App Feedback (toasts/popups from logcat)")
+            for msg in logcat_feedback[:5]:
+                user_parts.append(f"  {msg}")
+
         # Frida events
         if new_frida_events:
             user_parts.append(f"\n## Frida Events (since last action) — {len(new_frida_events)} new")
@@ -307,8 +355,6 @@ class AutonomousExplorer:
                 user_parts.append(f"  {evt[:120]}")
         else:
             user_parts.append("\n## Frida Events — (none since last action)")
-
-        # Current screen
         user_parts.append(f"\n## Current Screen\n```\n{ui_text}\n```")
 
         # History (last 5 steps)
@@ -365,6 +411,7 @@ class AutonomousExplorer:
 
                 if decision and self._validate_decision(decision, elements):
                     self._llm_failures = 0
+                    self._fallback_consecutive = 0
                     return decision
 
                 # JSON parsed but validation failed — try regex extraction
@@ -372,6 +419,7 @@ class AutonomousExplorer:
                     decision = _regex_extract_action(raw)
                     if decision and self._validate_decision(decision, elements):
                         self._llm_failures = 0
+                        self._fallback_consecutive = 0
                         return decision
 
             except Exception as e:
@@ -389,6 +437,9 @@ class AutonomousExplorer:
                         pass
                     self._llm_failures += 1
 
+        # Track consecutive fallback usage
+        self._fallback_consecutive += 1
+
         # ---- Smarter fallback ----
         # If we're on a system dialog, try clicking an OK/Allow button
         screen_is_dialog = screen.get("is_system_dialog", False)
@@ -398,6 +449,7 @@ class AutonomousExplorer:
                 if el.get("clickable") and el.get("enabled", True) and text in ("ok", "allow", "continue", "yes", "got it"):
                     center = el.get("center", [])
                     if len(center) == 2:
+                        self._fallback_consecutive = 0
                         return {"action": "click", "target_index": el.get("index", 1),
                                 "x": center[0], "y": center[1],
                                 "reason": "Fallback — dismiss system dialog"}
@@ -407,29 +459,43 @@ class AutonomousExplorer:
                 el = clickable[-1]
                 center = el.get("center", [])
                 if len(center) == 2:
+                    self._fallback_consecutive = 0
                     return {"action": "click", "target_index": el.get("index", 1),
                             "x": center[0], "y": center[1],
                             "reason": "Fallback — click dialog button"}
 
-        # If there are clickable elements, try the first one instead of pressing back
+        # If 4+ consecutive fallbacks, we're stuck — do NOT keep pressing back
+        if self._fallback_consecutive >= 4:
+            self._stop_reason = "fallback_loop"
+            return {"action": "done", "done": True, "reason": "Fallback loop — nothing productive to do"}
+
+        # If there are clickable elements, try clicking one (avoid back-press loops)
         if elements and self._llm_failures < self._cfg.llm_max_failures:
+            # Prefer unvisited-looking elements (different text from recent fallbacks)
             for el in elements:
                 if el.get("clickable") and el.get("enabled", True):
                     text = (el.get("text", "") or el.get("content_desc", "") or "").strip()
                     center = el.get("center", [])
                     if len(center) == 2:
+                        self._fallback_consecutive = 0
                         return {"action": "click", "target_index": el.get("index", 1),
                                 "x": center[0], "y": center[1],
                                 "reason": f"Fallback — click '{text[:30]}'"}
             # Try swiping down (might reveal more content)
+            self._fallback_consecutive = 0
             return {"action": "swipe", "swipe_direction": "down",
                     "reason": "Fallback — swipe to discover content"}
 
-        # Last resort: press back
+        # Last resort: if LLM keeps failing, stop instead of back-looping
         if self._llm_failures >= self._cfg.llm_max_failures:
             self._stop_reason = "llm_failure"
             return {"action": "done", "done": True, "reason": "LLM failed repeatedly"}
-        return {"action": "press", "press_key": "back", "reason": "LLM fallback — go back"}
+        # Use BACK sparingly — only every 3rd fallback to avoid rapid back-loops
+        if self._fallback_consecutive % 3 == 0:
+            return {"action": "press", "press_key": "back", "reason": "Fallback — go back"}
+        # Otherwise try a swipe to discover content
+        return {"action": "swipe", "swipe_direction": "down",
+                "reason": "Fallback — swipe to find new content"}
 
     def _validate_decision(self, decision: dict, elements: list[dict]) -> bool:
         """Check that the LLM's decision is safe and executable."""
@@ -743,6 +809,68 @@ class AutonomousExplorer:
             return info.get("current_activity", "")
         except Exception:
             return ""
+
+    # ------------------------------------------------------------------
+    # Logcat polling for toast/popup feedback
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clear_logcat():
+        """Clear the logcat buffer so we only capture fresh feedback."""
+        try:
+            import subprocess
+            subprocess.run(
+                ["adb", "logcat", "-c"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _poll_logcat_feedback() -> list[str]:
+        """Poll logcat for toast/popup messages and app errors.
+
+        Returns up to 5 feedback strings — things the app told the user
+        that aren't visible in the uiautomator2 view hierarchy dump.
+
+        Looks for:
+        - Toast messages (text shown to the user)
+        - App-level exception/warning lines
+        - Popup-related log lines
+        """
+        feedback: list[str] = []
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["adb", "logcat", "-d", "-v", "brief"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return feedback
+
+            for line in result.stdout.split("\n"):
+                line_lower = line.lower()
+                # Toast messages
+                if "toast" in line_lower and ("show" in line_lower or "text" in line_lower):
+                    # Extract just the message part after the tag
+                    idx = line.rfind(":")
+                    if idx > 0:
+                        msg = line[idx + 1:].strip()
+                        if msg and len(msg) > 3:
+                            feedback.append(f"[Toast] {msg}")
+                # Exception traces from the target app
+                elif "androidruntime" in line_lower and ("fatal" in line_lower or "exception" in line_lower):
+                    feedback.append(f"[Crash] {line.strip()[-120:]}")
+                # Popup/dialog window added
+                elif "windowmanager" in line_lower and "popup" in line_lower:
+                    feedback.append(f"[Popup] Window added")
+
+                if len(feedback) >= 5:
+                    break
+        except Exception:
+            pass
+
+        return feedback
 
 
 # ---------------------------------------------------------------------------

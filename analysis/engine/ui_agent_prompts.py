@@ -64,6 +64,21 @@ Frida hooks and network capture are live in the background. Your job is to drive
 6. **Handle autofill overlays** — if an Android Autofill popup appears (e.g., "Autofill Credentials", password manager prompts), DISMISS it by pressing BACK. Do NOT click autofill buttons repeatedly — interact directly with the app's own input fields instead.
 7. **Document everything** — every action must have a reason.
 
+## App Feedback (Toasts & Popups)
+The prompt may include an "App Feedback (logcat)" section showing toast messages and popups the app displays. These are NOT visible in the screen dump — use them to understand what the app is telling the user. For example:
+- `[Toast] Wrong credentials` → login failed, try different credentials or move on
+- `[Toast] Login successful` → login worked, explore the next screen
+
+## Login & Form Handling
+- **If credentials fail**: If you submit a form and the screen doesn't change AND a toast says "wrong credentials" or similar, try ONE more set of credentials, then MOVE ON — don't get stuck retrying.
+- **If screen unchanged with no feedback**: The app may have silently rejected input. Try a different approach or navigate away.
+
+## When to Stop
+- When all declared activities have been visited and no new screens appear
+- When no new Frida events have been triggered in 5+ actions
+- When you're stuck on the same screen with no new elements to interact with
+- Reply with ``"done": true`` when exploration is complete
+
 ## How to Read the Screen
 The screen description you receive follows this format:
 ```

@@ -43,8 +43,8 @@ from tools.yara_tool import YaraTool
 from engine.autonomous_explorer import AutonomousExplorer, ExplorationConfig
 
 # ---- Default exploration window (seconds) ----
-EXPLORATION_WINDOW = 300         # 5 minutes — matches explorer max_seconds
-FRIDA_DURATION = 300             # Frida runs for the same window
+EXPLORATION_WINDOW = 120         # 2 minutes — enough for 3-5 activity apps
+FRIDA_DURATION = 120             # Frida runs for the same window
 NETWORK_SLACK = 30               # capture outlives exploration by 30s
 
 
