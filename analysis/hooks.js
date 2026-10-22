@@ -6,7 +6,18 @@
 //  10. SharedPreferences (sensitive local storage access)
 //  11. Native syscall hooks: connect() and open() via Interceptor.attach
 //
-// Frida 17.x: Java bridge is provided globally by the runtime.
+// Frida 17.x: Java bridge must be explicitly imported in V8 runtime.
+// The require() call below works when loaded via Frida's V8 engine.
+var Java;
+try {
+    var _javaBridge = require('frida-java-bridge');
+    Java = _javaBridge.default || _javaBridge;
+} catch (_e) {
+    // Fallback: Java may be a global in QJS runtime or older Frida versions
+    if (typeof Java === 'undefined') {
+        throw new Error('Java bridge not available: ' + _e.message);
+    }
+}
 
 var logs = [];
 
@@ -17,11 +28,23 @@ function log(msg) {
 }
 
 // Wait for Java VM to be ready (needed when using Frida spawn mode)
+// Guard checks typeof first — Java may not be defined at all if the
+// bridge hasn't loaded yet (e.g. ART runtime still initializing).
+var _javaRetries = 0;
+var _MAX_JAVA_RETRIES = 300;  // 30s @ 100ms intervals
 function waitForJava(callback) {
-    if (Java.available) {
+    if (typeof Java !== 'undefined' && Java.available) {
         Java.perform(callback);
     } else {
-        log("Waiting for Java VM to initialize...");
+        _javaRetries++;
+        if (_javaRetries > _MAX_JAVA_RETRIES) {
+            log("ERROR: Java VM did not become available after " + (_MAX_JAVA_RETRIES * 100 / 1000) + "s — giving up.");
+            send({ "type": "error", "data": "Java VM timeout after 30s" });
+            return;
+        }
+        if (_javaRetries === 1 || _javaRetries % 50 === 0) {
+            log("Waiting for Java VM to initialize... (attempt " + _javaRetries + ")");
+        }
         setTimeout(function () { waitForJava(callback); }, 100);
     }
 }

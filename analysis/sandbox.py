@@ -349,11 +349,19 @@ class SandboxOrchestrator:
 
         return session
 
-    def run_dynamic_analysis(self, package_name, apk_path, duration_seconds=30):
+    def run_dynamic_analysis(self, package_name, apk_path, duration_seconds=30, cleanup=True):
         """Orchestrates the dynamic analysis phase with lifecycle management.
-        
+
         A global timeout guard (DYNAMIC_ANALYSIS_TIMEOUT) prevents runaway
         APKs from blocking the analysis queue indefinitely.
+
+        Args:
+            package_name: The app's package identifier.
+            apk_path: Absolute path to the APK file.
+            duration_seconds: How long to monitor with Frida hooks.
+            cleanup: If True (default), uninstall the APK after analysis.
+                     Set to False when other tools (network capture, monkey)
+                     will run afterward and the orchestrator will clean up.
         """
         self.dynamic_logs = []
         self._abort_event.clear()
@@ -412,7 +420,10 @@ class SandboxOrchestrator:
                     session.detach()
                 except Exception:
                     pass
-            self.uninstall_apk(package_name)
+            if cleanup:
+                self.uninstall_apk(package_name)
+            else:
+                print(f"[Sandbox] Skipping uninstall — cleanup deferred to orchestrator.", flush=True)
 
         timed_out = watchdog_fired.is_set()
         return {

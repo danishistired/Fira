@@ -11,11 +11,13 @@ has (or doesn't need) static analysis findings.
 Pipeline (in order):
     1. extract_manifest  — get package name (required for Frida/Monkey)
     2. run_mobsf         — MobSF quick analysis (skips if not configured)
-    3. run_frida         — Frida dynamic hooks (primary runtime evidence)
-    4. capture_network   — mitmproxy traffic capture (alongside Frida)
-    5. run_monkey        — UI exploration (trigger hidden behaviors)
-    6. collect_logcat    — system logs
-    7. capture_screenshot— visual evidence
+    3. run_frida + capture_network — Frida hooks AND mitmproxy capture
+       run CONCURRENTLY for the same duration window so network traffic
+       from the instrumented app is captured.
+    4. run_monkey        — UI exploration (trigger hidden behaviors)
+    5. collect_logcat    — system logs
+    6. capture_screenshot— visual evidence
+    7. Cleanup            — uninstall APK
     8. Adversarial consensus — verdict from dynamic-only evidence
 
 Emits the same SSE event types as the full InvestigationOrchestrator
@@ -23,6 +25,8 @@ so the frontend requires no changes.
 """
 
 import json
+import threading
+import time
 from typing import Callable, Optional
 
 from engine.memory import InvestigationMemory
@@ -33,7 +37,8 @@ from tools.virustotal_tool import VirusTotalTool
 from tools.malwarebazaar_tool import MalwareBazaarTool
 from tools.yara_tool import YaraTool
 
-# Dynamic-only tool pipeline (fixed order, no planner)
+# Dynamic-only tool pipeline (fixed order, no planner).
+# capture_network_traffic is handled concurrently with run_frida — not listed here.
 DYNAMIC_PIPELINE = [
     {
         "tool": "run_mobsf",
@@ -46,14 +51,7 @@ DYNAMIC_PIPELINE = [
         "tool": "run_frida",
         "label": "Frida dynamic hooks",
         "agent": "behavior",
-        "args": {"duration_seconds": 20},
-    },
-    {
-        "tool": "capture_network_traffic",
-        "label": "Network traffic capture",
-        "agent": "network",
-        "args": {"duration_seconds": 20},
-        "optional": True,
+        "args": {"duration_seconds": 20, "cleanup": False},  # cleanup deferred to end
     },
     {
         "tool": "run_monkey",
@@ -129,6 +127,12 @@ class DynamicOnlyOrchestrator:
         print(f"[DynamicOnly] Package: {package_name}", flush=True)
 
         # ---- Step 2+: Dynamic tool pipeline ----
+        # Network capture is started in a background thread BEFORE Frida so
+        # the capture window overlaps with the instrumented app's execution.
+        network_thread = None
+        network_result = [None]  # mutable container — thread writes result here
+        network_duration = 20  # seconds, matches Frida duration
+
         for step_idx, step in enumerate(DYNAMIC_PIPELINE, start=2):
             tool_name = step["tool"]
             label = step["label"]
@@ -140,6 +144,24 @@ class DynamicOnlyOrchestrator:
             args["apk_path"] = apk_path
             if "run_frida" in tool_name or "run_monkey" in tool_name or "capture_network" in tool_name:
                 args["package_name"] = package_name
+
+            # ---- Special handling: start network capture BEFORE Frida ----
+            if tool_name == "run_frida":
+                # Fire-and-forget: start mitmproxy capture in background thread
+                def _capture_network():
+                    print("[DynamicOnly] Network capture thread starting...", flush=True)
+                    network_result[0] = self.tools.execute(
+                        "capture_network_traffic",
+                        apk_path=apk_path,
+                        package_name=package_name,
+                        duration_seconds=network_duration,
+                    )
+
+                network_thread = threading.Thread(target=_capture_network, daemon=True)
+                network_thread.start()
+                # Give mitmproxy time to bind the port and the emulator proxy to be set
+                time.sleep(2)
+                print("[DynamicOnly] Network capture running in background (alongside Frida)", flush=True)
 
             print(f"[DynamicOnly] Step {step_idx}: {tool_name}", flush=True)
             _emit("tool_start", {"tool": tool_name, "label": label, "agent": agent, "iteration": step_idx})
@@ -160,6 +182,33 @@ class DynamicOnlyOrchestrator:
             _emit("tool_done", {"tool": tool_name, "label": label, "agent": agent,
                                  "summary": result.get("summary", f"{tool_name} complete"),
                                  "success": result.get("success", False)})
+
+            # ---- After Frida: collect network capture results ----
+            if tool_name == "run_frida" and network_thread is not None:
+                print("[DynamicOnly] Waiting for network capture to finish...", flush=True)
+                network_thread.join(timeout=10)
+                if network_result[0] is not None:
+                    net_result = network_result[0]
+                    memory.add_tool_result("capture_network_traffic", net_result)
+                    _emit("tool_done", {
+                        "tool": "capture_network_traffic",
+                        "label": "Network traffic capture",
+                        "agent": "network",
+                        "summary": net_result.get("summary", "Network capture complete"),
+                        "success": net_result.get("success", False),
+                    })
+                    print(f"[DynamicOnly] Network capture complete: {net_result.get('summary', '')}", flush=True)
+                else:
+                    print("[DynamicOnly] Network capture returned no result (may have failed to start)", flush=True)
+
+        # ---- Final cleanup: uninstall the APK ----
+        print(f"[DynamicOnly] Cleanup: uninstalling {package_name}...", flush=True)
+        try:
+            from sandbox import SandboxOrchestrator
+            sb = SandboxOrchestrator()
+            sb.uninstall_apk(package_name)
+        except Exception as _cleanup_err:
+            print(f"[DynamicOnly] Cleanup uninstall failed (non-fatal): {_cleanup_err}", flush=True)
 
         # ---- Verdict generation ----
         _emit("consensus_start", {"message": "Generating verdict from dynamic evidence"})

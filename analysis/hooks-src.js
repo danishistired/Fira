@@ -19,11 +19,21 @@ function log(msg) {
 }
 
 // Wait for Java VM to be ready (needed when using Frida spawn mode)
+var _javaRetries = 0;
+var _MAX_JAVA_RETRIES = 300;  // 30s @ 100ms intervals
 function waitForJava(callback) {
-    if (Java.available) {
+    if (typeof Java !== 'undefined' && Java.available) {
         Java.perform(callback);
     } else {
-        log("Waiting for Java VM to initialize...");
+        _javaRetries++;
+        if (_javaRetries > _MAX_JAVA_RETRIES) {
+            log("ERROR: Java VM did not become available after " + (_MAX_JAVA_RETRIES * 100 / 1000) + "s — giving up.");
+            send({ "type": "error", "data": "Java VM timeout after 30s" });
+            return;
+        }
+        if (_javaRetries === 1 || _javaRetries % 50 === 0) {
+            log("Waiting for Java VM to initialize... (attempt " + _javaRetries + ")");
+        }
         setTimeout(function () { waitForJava(callback); }, 100);
     }
 }
