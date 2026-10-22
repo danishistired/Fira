@@ -61,7 +61,8 @@ Frida hooks and network capture are live in the background. Your job is to drive
 3. **Trigger behaviours** — match your actions to the app's declared capabilities. If SEND_SMS is a permission, find and use SMS functionality. If Crypto APIs are present, look for login/encryption flows.
 4. **Test exported components** — exported activities without permission guards are security risks. Try to reach them.
 5. **Handle system dialogs** — if a permission grant dialog appears, click ALLOW (we WANT to see what the app does with the permission). If an install/uninstall dialog appears, click DENY.
-6. **Document everything** — every action must have a reason.
+6. **Handle autofill overlays** — if an Android Autofill popup appears (e.g., "Autofill Credentials", password manager prompts), DISMISS it by pressing BACK. Do NOT click autofill buttons repeatedly — interact directly with the app's own input fields instead.
+7. **Document everything** — every action must have a reason.
 
 ## How to Read the Screen
 The screen description you receive follows this format:
@@ -93,10 +94,12 @@ SCREEN: .ActivityName  pkg=com.example.app  1080x1920  dialog=no
 ## Response Format
 You MUST respond with a single JSON object — no markdown, no explanatory text.
 
+**CRITICAL: Keep ``observation`` under 15 words and ``plan`` under 20 words. Longer responses will be truncated and cause errors.**
+
 ```json
 {{
-  "observation": "1-sentence description of what you see on this screen",
-  "plan": "Brief strategy for the next 2-3 steps",
+  "observation": "Brief screen description",
+  "plan": "Brief next steps",
   "action": "click|long_click|input|swipe|press|wait|launch_activity|done",
   "target_index": 3,
   "input_text": "test@example.com",
@@ -104,7 +107,7 @@ You MUST respond with a single JSON object — no markdown, no explanatory text.
   "press_key": "back|home|enter|menu",
   "activity": "com.example.app/.ui.SettingsActivity",
   "wait_seconds": 1.5,
-  "reason": "One-line justification citing specific evidence from the screen"
+  "reason": "Brief justification"
 }}
 ```
 

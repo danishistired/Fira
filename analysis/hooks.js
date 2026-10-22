@@ -20,29 +20,57 @@ function log(msg) {
     send({ "type": "log", "data": logMsg });
 }
 
-// Wait for Java VM to be ready (needed when using Frida spawn mode)
-// Guard checks typeof first — Java may not be defined at all if the
-// bridge hasn't loaded yet (e.g. ART runtime still initializing).
-var _javaRetries = 0;
-var _MAX_JAVA_RETRIES = 300;  // 30s @ 100ms intervals
-function waitForJava(callback) {
-    if (typeof Java !== 'undefined' && Java.available) {
-        Java.perform(callback);
-    } else {
-        _javaRetries++;
-        if (_javaRetries > _MAX_JAVA_RETRIES) {
-            log("ERROR: Java VM did not become available after " + (_MAX_JAVA_RETRIES * 100 / 1000) + "s — giving up.");
-            send({ "type": "error", "data": "Java VM timeout after 30s" });
-            return;
+// Inject Java hooks — handles both spawn and attach modes in QJS runtime.
+//
+// In QJS (the default Frida runtime), the `Java` global is injected
+// ASYNCHRONOUSLY after the script loads.  Calling `Java.perform()`
+// before it exists throws `ReferenceError: 'Java' is not defined`.
+//
+// Strategy:
+//   1. Poll until `typeof Java !== 'undefined'` (the bridge is loaded).
+//   2. Once defined, call `Java.perform()` — it internally defers the
+//      callback until the ART VM is ready.
+//   3. Budget: 60s total with exponential backoff (100ms → 500ms cap).
+var _javaWaitRetries = 0;
+var _javaWaitBackoff = 100;   // ms, doubles each step, capped at 500
+var _javaWaitTotalMs = 0;
+var _JAVA_WAIT_BUDGET_MS = 60000;  // 60s total
+
+function waitForJavaBridge(callback) {
+    if (typeof Java !== 'undefined') {
+        // Bridge is loaded — Java.perform() handles VM readiness internally
+        log("Java bridge available. Calling Java.perform()...");
+        try {
+            Java.perform(callback);
+        } catch (e) {
+            // Extremely rare: bridge loaded but perform fails
+            log("ERROR: Java.perform() threw after bridge was ready: " + e);
+            send({ "type": "error", "data": "Java.perform() error: " + e });
         }
-        if (_javaRetries === 1 || _javaRetries % 50 === 0) {
-            log("Waiting for Java VM to initialize... (attempt " + _javaRetries + ")");
-        }
-        setTimeout(function () { waitForJava(callback); }, 100);
+        return;
     }
+
+    _javaWaitRetries++;
+    _javaWaitTotalMs += _javaWaitBackoff;
+
+    if (_javaWaitTotalMs > _JAVA_WAIT_BUDGET_MS) {
+        log("ERROR: Java bridge did not load after " + (_javaWaitTotalMs / 1000) + "s — giving up. Java hooks will NOT be active.");
+        send({ "type": "error", "data": "Java bridge timeout after " + (_javaWaitTotalMs / 1000) + "s" });
+        return;
+    }
+
+    if (_javaWaitRetries === 1 || _javaWaitRetries % 50 === 0) {
+        log("Waiting for Java bridge... (attempt " + _javaWaitRetries + ", " + Math.round(_javaWaitTotalMs / 1000) + "s elapsed)");
+    }
+
+    var delay = _javaWaitBackoff;
+    if (_javaWaitBackoff < 500) {
+        _javaWaitBackoff = Math.min(_javaWaitBackoff * 2, 500);
+    }
+    setTimeout(function () { waitForJavaBridge(callback); }, delay);
 }
 
-waitForJava(function () {
+waitForJavaBridge(function () {
     log("Frida hooks injected successfully.");
 
     // 1. Hook Cryptography (javax.crypto.Cipher)

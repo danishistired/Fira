@@ -30,6 +30,11 @@ SYSTEM_DIALOG_PACKAGES = frozenset({
     "com.android.packageinstaller",
     "com.google.android.packageinstaller",
     "com.android.systemui",
+    # Android Autofill service overlays (popup credential pickers)
+    "com.android.settings",
+    "com.google.android.gms",        # Google autofill / Smart Lock
+    "com.android.autofill",
+    "com.google.android.autofill",
 })
 
 # Packages / package prefixes to always hide (status bar, nav bar, launcher chrome).

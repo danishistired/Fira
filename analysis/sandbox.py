@@ -372,7 +372,7 @@ class SandboxOrchestrator:
 
         # Now load hooks — Java runtime should be available
         script_code = self._load_hooks_script()
-        script = session.create_script(script_code)  # default QJS runtime — Java is a global
+        script = session.create_script(script_code, runtime="v8")
         script.on('message', _handshake_handler)
         script.load()
 
@@ -440,7 +440,7 @@ class SandboxOrchestrator:
                 print(f"[Sandbox] Attached to PID {pid}")
 
                 script_code = self._load_hooks_script()
-                script = session.create_script(script_code)  # default QJS runtime — Java is a global
+                script = session.create_script(script_code, runtime="v8")
                 script.on('message', self.on_frida_message)
                 script.load()
 
@@ -549,13 +549,12 @@ class SandboxOrchestrator:
     def start_frida_session(self, package_name, apk_path, max_seconds=330):
         """Start a streaming Frida session and return a live handle.
 
-        Installs the APK, spawns + instruments with Frida hooks, and returns
-        a ``FridaStreamHandle`` that the caller can poll via ``poll_new_logs()``
-        while the app is running.  The caller MUST call ``handle.stop()`` when
-        done, which detaches the session and cancels the watchdog.
+        Uses **attach-first** strategy: launches the app normally, dismisses
+        any system dialogs, then attaches Frida to the already-running
+        process (Java VM already initialised).  Falls back to spawn mode
+        only if the process can't be found.
 
-        Returns a dict:
-            {"success": bool, "handle": FridaStreamHandle | None, "error": str}
+        Returns a ``FridaStreamHandle``.  Caller MUST call ``handle.stop()``.
         """
         self.dynamic_logs = []
         self._abort_event.clear()
@@ -574,7 +573,7 @@ class SandboxOrchestrator:
             return {"success": False, "handle": None, "error": "Failed to install APK"}
 
         # Start global watchdog
-        watchdog_fired = [False]  # mutable container for the Timer closure
+        watchdog_fired = [False]
 
         def _watchdog():
             print(f"[Sandbox] WATCHDOG: Frida session exceeded {max_seconds}s — forcing abort", flush=True)
@@ -586,27 +585,184 @@ class SandboxOrchestrator:
         watchdog.daemon = True
         watchdog.start()
 
-        # 2. Instrument
+        # 2. Instrument — attach-first strategy
         session = None
         try:
-            session = self._spawn_and_instrument_session(package_name)
-        except Exception as spawn_err:
-            print(f"[Sandbox] Frida spawn failed ({spawn_err}), trying fallback...")
+            # Primary: launch app via ADB, dismiss dialogs, attach Frida
+            session = self._launch_and_attach_session(package_name)
+        except Exception as attach_err:
+            print(f"[Sandbox] Attach-first failed ({attach_err}), trying spawn fallback...", flush=True)
             try:
-                session = self._attach_with_retry_session(package_name)
-            except frida.ProcessNotFoundError:
-                print("[Sandbox] Frida could not find the running process after retries.")
-                self.dynamic_logs.append("Frida: Process exited or crashed before attachment.")
+                session = self._spawn_and_instrument_session(package_name)
+            except Exception as spawn_err:
+                print(f"[Sandbox] Spawn fallback also failed: {spawn_err}", flush=True)
+                self.dynamic_logs.append(f"Sandbox Error: {spawn_err}")
                 watchdog.cancel()
-                return {"success": False, "handle": None, "error": "Process not found"}
-            except Exception as e:
-                print(f"[Sandbox] Frida Error: {e}")
-                self.dynamic_logs.append(f"Sandbox Error: {e}")
-                watchdog.cancel()
-                return {"success": False, "handle": None, "error": str(e)}
+                return {"success": False, "handle": None, "error": str(spawn_err)}
 
         handle = FridaStreamHandle(self, session, watchdog)
         return {"success": True, "handle": handle, "error": ""}
+
+    def _launch_and_attach_session(self, package_name):
+        """Launch app via ADB, dismiss system dialogs, then attach Frida.
+
+        This is more reliable than spawn mode because the Java VM is already
+        initialised when the app runs normally. System dialogs ("older
+        Android version", etc.) are dismissed before attachment.
+
+        Improvements:
+        - Polls until the app's activity is in foreground (up to 10s)
+        - Verifies PID alive right before Frida attach
+        - Longer settle time for ART VM initialization
+        - Force-stops Expo Go if it's interfering
+        - Disables Android Autofill service to prevent overlay popups
+        """
+        print("[Sandbox] Launching app via ADB (attach-first strategy)...", flush=True)
+
+        self.device = frida.get_usb_device(timeout=5)
+
+        # ---- Disable Android Autofill service ----
+        # The autofill popup ("Autofill Credentials") blocks the app UI and
+        # causes infinite dismiss loops. Disabling it is the cleanest fix.
+        try:
+            subprocess.run(
+                ["adb", "shell", "settings", "put", "secure", "autofill_service", "null"],
+                capture_output=True, timeout=5,
+            )
+            print("[Sandbox] Disabled Android Autofill service", flush=True)
+        except Exception:
+            pass
+
+        # Force-stop known focus-stealing packages before launch
+        # NOTE: Do NOT force-stop launchers — that causes Google Search / QSB
+        # to steal focus instead, making things worse.
+        for nuisance_pkg in ("host.exp.exponent",):
+            try:
+                subprocess.run(
+                    ["adb", "shell", "am", "force-stop", nuisance_pkg],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+
+        # Launch the app via monkey
+        pid = self.launch_app(package_name)
+        if pid is None:
+            raise frida.ProcessNotFoundError(f"Could not launch {package_name}")
+
+        # ---- Dismiss system dialogs aggressively ----
+        # "App made for older version" and similar dialogs appear immediately
+        # after launch. Dismiss them with Enter + tap before proceeding.
+        for _ in range(5):
+            time.sleep(0.8)
+            try:
+                # Press Enter (clicks default button on most dialogs)
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                    capture_output=True, timeout=3,
+                )
+            except Exception:
+                pass
+
+        # ---- Wait for app to be fully in foreground (up to 10s) ----
+        # This ensures the ART runtime has fully initialized before Frida attaches.
+        print("[Sandbox] Waiting for app to settle in foreground...", flush=True)
+        deadline = time.time() + 10
+        app_ready = False
+        while time.time() < deadline:
+            try:
+                # Check if the target app is the current foreground activity
+                fg_check = subprocess.run(
+                    ["adb", "shell", "dumpsys", "activity", "activities"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if package_name in fg_check.stdout and "mResumedActivity" in fg_check.stdout:
+                    # Also verify PID is still alive
+                    pid_check = subprocess.run(
+                        ["adb", "shell", "pidof", package_name],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    pid_str = pid_check.stdout.strip()
+                    if pid_str:
+                        pid = int(pid_str.split()[0])
+                        app_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not app_ready:
+            # Fallback: just check PID
+            try:
+                check = subprocess.run(
+                    ["adb", "shell", "pidof", package_name],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pid_str = check.stdout.strip()
+                if pid_str:
+                    pid = int(pid_str.split()[0])
+                    print(f"[Sandbox] App running with PID {pid} (activity check inconclusive)", flush=True)
+                else:
+                    # Try relaunching
+                    print("[Sandbox] App process lost — relaunching...", flush=True)
+                    pid = self.launch_app(package_name)
+                    if pid is None:
+                        raise frida.ProcessNotFoundError(f"Process {package_name} not found after relaunch")
+                    time.sleep(3)
+                    # Dismiss dialogs again
+                    for _ in range(3):
+                        subprocess.run(
+                            ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                            capture_output=True, timeout=3,
+                        )
+                        time.sleep(0.5)
+            except frida.ProcessNotFoundError:
+                raise
+            except Exception:
+                pass
+        else:
+            print(f"[Sandbox] App running with PID {pid} after dialog dismissal", flush=True)
+
+        # ---- Extra settle time for ART VM ----
+        # The Java VM needs a moment after the activity resumes to be fully
+        # ready for Frida hook injection.
+        time.sleep(2)
+
+        # ---- Verify PID is alive right before attach ----
+        try:
+            check = subprocess.run(
+                ["adb", "shell", "pidof", package_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            pid_str = check.stdout.strip()
+            if pid_str:
+                pid = int(pid_str.split()[0])
+            else:
+                raise frida.ProcessNotFoundError(f"PID for {package_name} disappeared before Frida attach")
+        except frida.ProcessNotFoundError:
+            raise
+        except Exception:
+            pass
+
+        # Attach Frida
+        print(f"[Sandbox] Attaching Frida to PID {pid}...", flush=True)
+        session = self.device.attach(pid)
+        print(f"[Sandbox] Attached to PID {pid}", flush=True)
+
+        # Load hooks — Java VM is already running so hooks should inject immediately
+        script_code = self._load_hooks_script()
+        script = session.create_script(script_code, runtime="v8")
+        script.on('message', self.on_frida_message)
+        script.load()
+
+        # Wait briefly for Java hooks to confirm
+        time.sleep(3)
+        for log_line in self.dynamic_logs[-5:]:
+            if "Frida hooks injected successfully" in log_line:
+                print("[Sandbox] Java hooks confirmed active!", flush=True)
+                break
+
+        return session
 
 if __name__ == "__main__":
     # Test script standalone

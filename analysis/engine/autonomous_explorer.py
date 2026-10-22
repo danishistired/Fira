@@ -34,8 +34,9 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_SECONDS = 300       # 5 minutes
 DEFAULT_STEP_SETTLE = 0.8       # seconds to wait after each action
 UI_STALL_LIMIT = 4               # same screen N times in a row → done
-LLM_MAX_FAILURES = 5             # consecutive LLM parse failures → fallback
-APP_RELAUNCH_ATTEMPTS = 2        # crash recovery retries
+LLM_MAX_FAILURES = 8             # consecutive LLM parse failures → fallback
+APP_RELAUNCH_ATTEMPTS = 5        # crash recovery retries
+RELAUNCH_COOLDOWN = 3.0          # min seconds between relaunches
 
 # Valid actions the LLM can request
 _VALID_ACTIONS = frozenset({
@@ -51,6 +52,9 @@ _LAUNCHER_PACKAGES = frozenset({
     "com.android.launcher", "com.android.launcher3",
     "com.google.android.apps.nexuslauncher",
     "com.android.systemui",
+    "host.exp.exponent",              # Expo Go — steals focus on some emulators
+    "com.android.settings",
+    "com.google.android.googlequicksearchbox",  # Google Search / QSB
 })
 
 
@@ -123,6 +127,10 @@ class AutonomousExplorer:
         self._llm_failures = 0
         self._relaunch_count = 0
         self._system_prompt = ""
+        # Anti-loop: track dismissed dialog button texts to break infinite cycles
+        self._dismissed_dialog_counts: dict[str, int] = {}
+        # Anti-storm: minimum interval between relaunches
+        self._last_relaunch_time = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,8 +158,8 @@ class AutonomousExplorer:
         # Re-launch the app to ensure it's in the foreground
         self._launch_app()
 
-        # ---- Pre-flight: dismiss any system dialogs (compatibility warnings, etc.) ----
-        for _ in range(3):  # up to 3 stacked dialogs
+        # ---- Pre-flight: dismiss system dialogs (compat warnings, etc.) ----
+        for _ in range(5):
             if not self._dismiss_system_dialogs():
                 break
             time.sleep(0.5)
@@ -232,6 +240,7 @@ class AutonomousExplorer:
         ):
             self._stop_reason = "ui_stall"
             return False
+
 
         # ---- Collect Frida events ----
         new_frida_events: list[str] = []
@@ -336,7 +345,7 @@ class AutonomousExplorer:
                     model=MODEL_EXPLORER,
                     messages=messages,
                     temperature=0.2 + (attempt - 1) * 0.1,
-                    max_tokens=600,
+                    max_tokens=800,
                 )
                 raw = (response.choices[0].message.content or "").strip()
 
@@ -358,10 +367,26 @@ class AutonomousExplorer:
                     self._llm_failures = 0
                     return decision
 
+                # JSON parsed but validation failed — try regex extraction
+                if decision is None:
+                    decision = _regex_extract_action(raw)
+                    if decision and self._validate_decision(decision, elements):
+                        self._llm_failures = 0
+                        return decision
+
             except Exception as e:
                 print(f"[Explorer] LLM error (attempt {attempt}): {e}", flush=True)
                 # Don't count empty responses as hard failures
                 if "Empty LLM response" not in str(e):
+                    # Try regex extraction from raw before giving up
+                    try:
+                        if raw:
+                            decision = _regex_extract_action(raw)
+                            if decision and self._validate_decision(decision, elements):
+                                self._llm_failures = 0
+                                return decision
+                    except Exception:
+                        pass
                     self._llm_failures += 1
 
         # ---- Smarter fallback ----
@@ -390,9 +415,9 @@ class AutonomousExplorer:
         if elements and self._llm_failures < self._cfg.llm_max_failures:
             for el in elements:
                 if el.get("clickable") and el.get("enabled", True):
+                    text = (el.get("text", "") or el.get("content_desc", "") or "").strip()
                     center = el.get("center", [])
                     if len(center) == 2:
-                        text = el.get("text", "") or el.get("content_desc", "") or "element"
                         return {"action": "click", "target_index": el.get("index", 1),
                                 "x": center[0], "y": center[1],
                                 "reason": f"Fallback — click '{text[:30]}'"}
@@ -579,7 +604,13 @@ class AutonomousExplorer:
             pass
 
     def _check_app_alive(self):
-        """Check if the app is still in the foreground.  Relaunch if dead."""
+        """Check if the app is still in the foreground.  Relaunch if dead.
+
+        Improvements over the naive version:
+        - Force-stops interfering packages (e.g. Expo Go) before relaunching
+        - Cooldown prevents rapid-fire relaunch storms
+        - Resets dismissed-dialog counters on relaunch
+        """
         try:
             info_result = self._ui.execute(action="info")
             if not info_result.get("success"):
@@ -589,13 +620,46 @@ class AutonomousExplorer:
             # Is the app gone?
             if current_pkg and current_pkg != self._package:
                 if current_pkg in _LAUNCHER_PACKAGES or not current_pkg.startswith(self._package):
-                    print(f"[Explorer] App left foreground (now: {current_pkg}). Relaunching...", flush=True)
+                    # Cooldown: don't relaunch if we just did
+                    now = time.time()
+                    if now - self._last_relaunch_time < RELAUNCH_COOLDOWN:
+                        return
+
                     if self._relaunch_count < self._cfg.relaunch_attempts:
                         self._relaunch_count += 1
+                        self._last_relaunch_time = now
+                        print(f"[Explorer] App left foreground (now: {current_pkg}). "
+                              f"Relaunch {self._relaunch_count}/{self._cfg.relaunch_attempts}...", flush=True)
+
+                        # Force-stop the interfering package so it doesn't steal focus again.
+                        # NEVER force-stop launchers or system UI — that causes Google
+                        # Search / QSB to open instead, making things worse.
+                        _NEVER_FORCE_STOP = frozenset({
+                            "com.android.systemui",
+                            "com.android.launcher", "com.android.launcher3",
+                            "com.google.android.apps.nexuslauncher",
+                            "com.google.android.googlequicksearchbox",
+                            "com.android.settings",
+                        })
+                        if current_pkg and current_pkg not in _NEVER_FORCE_STOP:
+                            try:
+                                import subprocess
+                                subprocess.run(
+                                    ["adb", "shell", "am", "force-stop", current_pkg],
+                                    capture_output=True, timeout=5,
+                                )
+                                print(f"[Explorer] Force-stopped {current_pkg}", flush=True)
+                            except Exception:
+                                pass
+
                         # Press back to dismiss any system dialog
                         self._ui.execute(action="press", key="back")
                         time.sleep(0.5)
                         self._launch_app()
+
+                        # Reset dialog dismiss counters for fresh session
+                        self._dismissed_dialog_counts.clear()
+
                         # Dismiss any dialogs that appear after relaunch
                         time.sleep(1)
                         for _ in range(3):
@@ -612,6 +676,10 @@ class AutonomousExplorer:
 
         Returns True if a dialog was found and dismissed, False otherwise.
         Handles: "app made for older version", ANR dialogs, permission prompts.
+
+        Anti-loop: tracks how many times each button text has been dismissed.
+        If the same button has been clicked 2+ times, it's a loop — skip it
+        and press BACK instead (breaks the Autofill Credentials cycle).
         """
         try:
             dump = self._ui.execute(action="dump", target_package=self._package)
@@ -627,10 +695,11 @@ class AutonomousExplorer:
                 return False
 
             # Find the best button to click: prefer OK/Allow/Continue, avoid Deny/Cancel
+            _POSITIVE_TEXTS = {"ok", "allow", "continue", "yes", "got it", "close"}
             ok_button = None
             for el in elements:
                 text = (el.get("text", "") or el.get("content_desc", "")).lower()
-                if text in ("ok", "allow", "continue", "yes", "got it", "close"):
+                if text in _POSITIVE_TEXTS:
                     ok_button = el
                     break
 
@@ -641,16 +710,31 @@ class AutonomousExplorer:
                     ok_button = clickable[-1]  # last button is typically OK/Allow
 
             if ok_button:
+                btn_text = (ok_button.get("text", "") or ok_button.get("content_desc", "?")).strip()
+                btn_key = btn_text.lower()
+
+                # Anti-loop: if we've dismissed this exact button 2+ times, break the cycle
+                prev_count = self._dismissed_dialog_counts.get(btn_key, 0)
+                if prev_count >= 2:
+                    print(f"[Explorer] Dialog loop detected ('{btn_text}' dismissed {prev_count}x). "
+                          f"Giving up on this dialog.", flush=True)
+                    # DON'T press BACK — that exits the app when there's one activity.
+                    # Just stop trying.  The LLM will handle the dialog if it persists.
+                    self._dismissed_dialog_counts[btn_key] = 0
+                    return False  # signal "no more dialogs" to break caller's loop
+
                 center = ok_button.get("center", [])
                 if len(center) == 2:
-                    print(f"[Explorer] Dismissing system dialog: clicking '{ok_button.get('text', ok_button.get('content_desc', '?'))}'", flush=True)
+                    print(f"[Explorer] Dismissing system dialog: clicking '{btn_text}'", flush=True)
                     self._ui.execute(action="click", x=center[0], y=center[1])
+                    self._dismissed_dialog_counts[btn_key] = prev_count + 1
                     return True
 
         except Exception as e:
             print(f"[Explorer] Dialog dismissal error: {e}", flush=True)
 
         return False
+
 
     def _get_current_activity(self) -> str:
         """Get the current activity short name."""
@@ -713,3 +797,43 @@ def _repair_json(raw: str) -> str:
         raw += "}" * (open_count - close_count)
 
     return raw
+
+
+def _regex_extract_action(raw: str) -> dict | None:
+    """Last-resort extraction of action fields from truncated LLM JSON.
+
+    When the JSON is too broken for ``json.loads`` even after repair,
+    we use regex to extract the ``action`` and ``target_index`` fields
+    so the explorer can still make progress instead of falling back
+    to blind clicking.
+    """
+    import re
+
+    action_match = re.search(r'"action"\s*:\s*"(\w+)"', raw)
+    if not action_match:
+        return None
+
+    action = action_match.group(1)
+    result = {"action": action, "reason": "Regex fallback from truncated JSON"}
+
+    # Extract target_index
+    idx_match = re.search(r'"target_index"\s*:\s*(\d+)', raw)
+    if idx_match:
+        result["target_index"] = int(idx_match.group(1))
+
+    # Extract input_text
+    input_match = re.search(r'"input_text"\s*:\s*"([^"]*)"', raw)
+    if input_match:
+        result["input_text"] = input_match.group(1)
+
+    # Extract swipe_direction
+    swipe_match = re.search(r'"swipe_direction"\s*:\s*"(\w+)"', raw)
+    if swipe_match:
+        result["swipe_direction"] = swipe_match.group(1)
+
+    # Extract press_key
+    key_match = re.search(r'"press_key"\s*:\s*"(\w+)"', raw)
+    if key_match:
+        result["press_key"] = key_match.group(1)
+
+    return result
