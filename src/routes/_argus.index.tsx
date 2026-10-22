@@ -12,6 +12,7 @@ import {
   CircleDot,
   ChevronDown,
   Hexagon,
+  Trash2,
 } from "lucide-react";
 
 export const Route = createFileRoute("/_argus/")({
@@ -567,6 +568,16 @@ export function Home() {
     setDrawerOpen(false);
   };
 
+  const clearAllData = () => {
+    if (!window.confirm("Clear all conversations and cached data? This cannot be undone.")) return;
+    localStorage.removeItem("argus_conversations");
+    localStorage.removeItem("argus_activeId");
+    const fresh = makeConversation("Untitled analysis");
+    setConversations([fresh]);
+    setActiveId(fresh.id);
+    setDrawerOpen(false);
+  };
+
   if (!active) return null;
   const hasContent = active.messages.length > 0;
 
@@ -645,6 +656,16 @@ export function Home() {
                     )}
                   </button>
                 ))}
+              </div>
+              <div className="mt-2 border-t border-white/[0.06] pt-2">
+                <button
+                  onClick={clearAllData}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] text-red-400/70 hover:bg-red-500/10 hover:text-red-300 transition"
+                  title="Clear all conversations & cache"
+                >
+                  <Trash2 size={13} strokeWidth={1.5} />
+                  Clear all data
+                </button>
               </div>
             </motion.aside>
           </>
