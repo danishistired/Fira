@@ -6,18 +6,11 @@
 //  10. SharedPreferences (sensitive local storage access)
 //  11. Native syscall hooks: connect() and open() via Interceptor.attach
 //
-// Frida 17.x: Java bridge must be explicitly imported in V8 runtime.
-// The require() call below works when loaded via Frida's V8 engine.
-var Java;
-try {
-    var _javaBridge = require('frida-java-bridge');
-    Java = _javaBridge.default || _javaBridge;
-} catch (_e) {
-    // Fallback: Java may be a global in QJS runtime or older Frida versions
-    if (typeof Java === 'undefined') {
-        throw new Error('Java bridge not available: ' + _e.message);
-    }
-}
+// Frida 17.x: Java is available as a global in the default (QJS) runtime
+// once the ART/VM initialises. The typeof guard in waitForJava handles the
+// window before the VM is ready.
+// NOTE: if loaded with runtime='v8', Java may NOT be a global — use the
+// default QJS runtime (omit the runtime parameter in create_script).
 
 var logs = [];
 
@@ -252,68 +245,77 @@ waitForJava(function () {
     }
 });
 
-// ======================================================
-// Phase 2: Native-layer syscall hooks
-// Hook connect() and open() at the libc/linker level.
-// These catch cases where native code bypasses Java entirely.
-// ======================================================
+// Native hooks run immediately — they don't depend on the Java VM.
+// Guard each call since QJS/V8 runtimes may expose Frida globals differently.
+function _installNativeHooks() {
+    log("Installing native hooks...");
 
-try {
-    // Hook libc connect() — catches raw socket connections
-    var connectPtr = Module.findExportByName("libc.so", "connect");
-    if (connectPtr) {
-        Interceptor.attach(connectPtr, {
-            onEnter: function (args) {
-                try {
-                    var sockfd = args[0].toInt32();
-                    var addrlen = args[2].toInt32();
-                    if (addrlen >= 16) {
-                        // Try to read sin_addr (IPv4: bytes 4-7 of sockaddr_in)
-                        var sinFamily = args[1].readU16();
-                        if (sinFamily === 2) { // AF_INET
-                            var port = ((args[1].add(2).readU8() << 8) | args[1].add(3).readU8());
-                            var ip = [
-                                args[1].add(4).readU8(),
-                                args[1].add(5).readU8(),
-                                args[1].add(6).readU8(),
-                                args[1].add(7).readU8(),
-                            ].join(".");
-                            if (ip !== "0.0.0.0" && ip !== "127.0.0.1") {
-                                log(`Native: connect() to ${ip}:${port} (AF_INET)`);
+    // ---- connect() ----
+    try {
+        if (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function') {
+            var connectPtr = Module.findExportByName("libc.so", "connect");
+            if (connectPtr && typeof Interceptor !== 'undefined' && typeof Interceptor.attach === 'function') {
+                Interceptor.attach(connectPtr, {
+                    onEnter: function (args) {
+                        try {
+                            var sockfd = args[0].toInt32();
+                            var addrlen = args[2].toInt32();
+                            if (addrlen >= 16) {
+                                var sinFamily = args[1].readU16();
+                                if (sinFamily === 2) {
+                                    var port = ((args[1].add(2).readU8() << 8) | args[1].add(3).readU8());
+                                    var ip = [
+                                        args[1].add(4).readU8(),
+                                        args[1].add(5).readU8(),
+                                        args[1].add(6).readU8(),
+                                        args[1].add(7).readU8(),
+                                    ].join(".");
+                                    if (ip !== "0.0.0.0" && ip !== "127.0.0.1") {
+                                        log("Native: connect() to " + ip + ":" + port + " (AF_INET)");
+                                    }
+                                }
                             }
-                        }
+                        } catch (e2) { /* ignore parsing errors */ }
                     }
-                } catch (e2) { /* ignore parsing errors */ }
+                });
+                log("Native hook: connect() installed");
             }
-        });
-        log("Native hook: connect() installed");
+        }
+    } catch (e) {
+        log("Failed to hook native connect(): " + e);
     }
-} catch (e) {
-    log(`Failed to hook native connect(): ${e}`);
+
+    // ---- open() ----
+    try {
+        if (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function') {
+            var openPtr = Module.findExportByName("libc.so", "open");
+            if (openPtr && typeof Interceptor !== 'undefined' && typeof Interceptor.attach === 'function') {
+                Interceptor.attach(openPtr, {
+                    onEnter: function (args) {
+                        try {
+                            var path = args[0].readUtf8String();
+                            if (path && !path.startsWith("/system") && !path.startsWith("/proc")
+                                && !path.startsWith("/dev") && !path.startsWith("/apex")) {
+                                if (path.includes(".dex") || path.includes(".apk") ||
+                                    path.includes("/sdcard") || path.includes("/data/data")) {
+                                    log("Native: open(\"" + path + "\")");
+                                }
+                            }
+                        } catch (e2) { /* ignore */ }
+                    }
+                });
+                log("Native hook: open() installed");
+            }
+        }
+    } catch (e) {
+        log("Failed to hook native open(): " + e);
+    }
 }
 
-try {
-    // Hook libc open() — catches native file access outside Java's File class
-    var openPtr = Module.findExportByName("libc.so", "open");
-    if (openPtr) {
-        Interceptor.attach(openPtr, {
-            onEnter: function (args) {
-                try {
-                    var path = args[0].readUtf8String();
-                    // Only log suspicious paths (not system, proc, or dev)
-                    if (path && !path.startsWith("/system") && !path.startsWith("/proc")
-                        && !path.startsWith("/dev") && !path.startsWith("/apex")) {
-                        if (path.includes(".dex") || path.includes(".apk") ||
-                            path.includes("/sdcard") || path.includes("/data/data")) {
-                            log(`Native: open("${path}")`);
-                        }
-                    }
-                } catch (e2) { /* ignore */ }
-            }
-        });
-        log("Native hook: open() installed");
-    }
-} catch (e) {
-    log(`Failed to hook native open(): ${e}`);
-}
+// ---- Immediately install native hooks (no Java VM needed) ----
+_installNativeHooks();
+
+// ---- Tell the Python side the script is loaded and running ----
+send({ "type": "status", "data": "script_loaded" });
+log("Frida script loaded. Native hooks installed. Waiting for Java VM...");
 

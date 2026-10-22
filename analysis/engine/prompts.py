@@ -17,6 +17,8 @@ Three key prompts:
 # deepseek-v4-flash         → normal tasks: conversational follow-up Q&A
 MODEL_DECISION = "deepseek-reasoner"  # multi-step reasoning, large context
 MODEL_FAST = "deepseek-v4-flash"      # low-latency, single-turn tasks
+# MODEL_EXPLORER is defined in engine/ui_agent_prompts.py (also deepseek-v4-flash)
+# — imported from there by AutonomousExplorer
 
 
 def build_planner_system_prompt(tool_descriptors: list[dict], rag_context: str = "") -> str:

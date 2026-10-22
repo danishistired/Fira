@@ -15,6 +15,7 @@ import {
   Trash2,
   Zap,
   Shield,
+  Bot,
 } from "lucide-react";
 
 export const Route = createFileRoute("/_argus/")({
@@ -83,7 +84,15 @@ type Report = {
   mitreTechniques?: string[];
   agentFindings?: Record<string, AgentFinding>;
   correlations?: Correlation[];
-  analysisScope?: "static_only" | "static_and_dynamic";
+  analysisScope?: "static_only" | "static_and_dynamic" | "autonomous_dynamic";
+  exploration?: {
+    total_steps: number;
+    activities_visited: string[];
+    screens_explored: number;
+    elements_touched: number;
+    stop_reason: string;
+    frida_events_total?: number;
+  };
   package?: string;
   osint?: {
     virustotal?: {
@@ -132,6 +141,21 @@ const AGENT_TEMPLATE: Omit<Agent, "status">[] = [
 
 
 const newId = () => Math.random().toString(36).slice(2, 10);
+
+/** Emoji for explorer action types shown in the timeline. */
+const _stepEmoji = (action: string): string => {
+  switch (action) {
+    case "click": return "👆";
+    case "long_click": return "👆⏳";
+    case "input": return "⌨️";
+    case "swipe": return "👈";
+    case "press": return "↩️";
+    case "wait": return "⏳";
+    case "launch_activity": return "🚀";
+    case "done": return "✅";
+    default: return "🔍";
+  }
+};
 
 const makeConversation = (title = "New analysis"): Conversation => ({
   id: newId(),
@@ -188,7 +212,7 @@ export function Home() {
   }, [activeId, isMounted]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [input, setInput] = useState("");
-  const [dynamicOnlyMode, setDynamicOnlyMode] = useState(false);
+  const [analysisMode, setAnalysisMode] = useState<"full" | "dynamic_only" | "autonomous">("full");
   const fileRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -283,7 +307,7 @@ export function Home() {
     // Use FormData + fetch to upload, then parse SSE from the response body
     const form = new FormData();
     form.append("file", file);
-    form.append("mode", dynamicOnlyMode ? "dynamic_only" : "full");
+    form.append("mode", analysisMode);
 
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let aborted = false;
@@ -388,6 +412,65 @@ export function Home() {
             setAgentStatus("threat", "running");
           }
 
+          // ---- Autonomous explorer events ----
+          else if (event === "explorer_start") {
+            const msg = `🤖 LLM exploring app UI (max ${payload.max_steps} steps, ${payload.max_seconds}s)`;
+            const stepId = "explorer-start";
+            pushTimelineStep(msg, stepId, "running");
+            setAgentStatus("behavior", "running");
+          }
+
+          else if (event === "explorer_step") {
+            const step = payload.step as number;
+            const action = payload.action as string;
+            const reason = (payload.reason as string) || "";
+            const stepId = `explorer-${step}`;
+            const label = `${_stepEmoji(action)} ${action} #${step} — ${reason.slice(0, 45)}${reason.length > 45 ? "…" : ""}`;
+            pushTimelineStep(label, stepId, "running");
+          }
+
+          else if (event === "explorer_action") {
+            const step = payload.step as number;
+            const stepId = `explorer-${step}`;
+            const summary = (payload.summary as string) || "";
+            setConversations((list) =>
+              list.map((c) =>
+                c.id !== convId
+                  ? c
+                  : {
+                      ...c,
+                      timeline: c.timeline.map((t) =>
+                        t.id === stepId
+                          ? { ...t, label: summary.length > 66 ? summary.slice(0, 63) + "…" : summary, status: "done" as const }
+                          : t,
+                      ),
+                    },
+              ),
+            );
+          }
+
+          else if (event === "explorer_done") {
+            const stepId = "explorer-start";
+            const screens = payload.screens_visited as number;
+            const steps = payload.total_steps as number;
+            const reason = payload.stop_reason as string;
+            setConversations((list) =>
+              list.map((c) =>
+                c.id !== convId
+                  ? c
+                  : {
+                      ...c,
+                      timeline: c.timeline.map((t) =>
+                        t.id === stepId
+                          ? { ...t, label: `🤖 Exploration complete: ${steps} steps, ${screens} screens (${reason})`, status: "done" as const }
+                          : t,
+                      ),
+                    },
+              ),
+            );
+            setAgentStatus("behavior", "done");
+          }
+
           else if (event === "consensus_start") {
             const stepId = "consensus";
             pushTimelineStep("Generating verdict", stepId, "running");
@@ -458,7 +541,8 @@ export function Home() {
                         mitreTechniques: result.mitre_techniques as string[],
                         agentFindings,
                         correlations: result.correlations as Correlation[],
-                        analysisScope: result.analysis_scope as "static_only" | "static_and_dynamic",
+                        analysisScope: result.analysis_scope as "static_only" | "static_and_dynamic" | "autonomous_dynamic",
+                        exploration: result.exploration as Report extends null ? never : NonNullable<Report>["exploration"],
                         package: result.package as string,
                         osint: result.osint as Report extends null ? never : NonNullable<Report>["osint"],
                         yaraRule: result.yara_rule as string | undefined,
@@ -717,28 +801,55 @@ export function Home() {
         <div className="w-full shrink-0 border-t border-white/[0.06] bg-[#0a0a0c]/95 backdrop-blur">
           <div className="mx-auto w-full max-w-3xl px-6 py-4">
 
-            {/* Dynamic-only mode toggle */}
-            <div className="mb-2.5 flex items-center gap-2">
-              <button
-                id="dynamic-mode-toggle"
-                onClick={() => setDynamicOnlyMode((v) => !v)}
-                title={dynamicOnlyMode ? "Switch to Full Analysis" : "Switch to Dynamic Analysis Only"}
-                className={`group flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium transition-all duration-200 ${
-                  dynamicOnlyMode
+            {/* Analysis mode selector — 3 pills */}
+            <div className="mb-2.5 flex items-center gap-1.5">
+              {(["full", "dynamic_only", "autonomous"] as const).map((mode) => {
+                const isActive = analysisMode === mode;
+                const icon =
+                  mode === "autonomous" ? (
+                    <Bot size={11} strokeWidth={1.5} />
+                  ) : mode === "dynamic_only" ? (
+                    <Zap size={11} strokeWidth={2} />
+                  ) : (
+                    <Shield size={11} strokeWidth={1.5} />
+                  );
+                const label =
+                  mode === "autonomous"
+                    ? "Deep Dive"
+                    : mode === "dynamic_only"
+                    ? "Dynamic Only"
+                    : "Full Analysis";
+                const activeClass =
+                  mode === "autonomous"
+                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.18)]"
+                    : mode === "dynamic_only"
                     ? "border-amber-500/40 bg-amber-500/10 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.15)]"
-                    : "border-white/[0.07] bg-white/[0.02] text-neutral-500 hover:border-white/[0.12] hover:text-neutral-300"
-                }`}
-              >
-                {dynamicOnlyMode ? (
-                  <Zap size={11} strokeWidth={2} className="text-amber-400" />
-                ) : (
-                  <Shield size={11} strokeWidth={1.5} />
-                )}
-                {dynamicOnlyMode ? "Dynamic Only" : "Full Analysis"}
-              </button>
-              {dynamicOnlyMode && (
+                    : "border-indigo-500/40 bg-indigo-500/10 text-indigo-300 shadow-[0_0_10px_rgba(99,102,241,0.15)]";
+                const idleClass =
+                  "border-white/[0.07] bg-white/[0.02] text-neutral-500 hover:border-white/[0.12] hover:text-neutral-300";
+                return (
+                  <button
+                    key={mode}
+                    id={`mode-${mode}`}
+                    onClick={() => setAnalysisMode(mode)}
+                    title={`Switch to ${label}`}
+                    className={`group flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-all duration-200 ${
+                      isActive ? activeClass : idleClass
+                    }`}
+                  >
+                    {icon}
+                    <span className="hidden sm:inline">{label}</span>
+                  </button>
+                );
+              })}
+              {analysisMode === "dynamic_only" && (
                 <span className="text-[10px] text-amber-500/70">
                   ⚡ Requires connected emulator · Skips static analysis
+                </span>
+              )}
+              {analysisMode === "autonomous" && (
+                <span className="text-[10px] text-emerald-500/70">
+                  🤖 Requires connected emulator · LLM-guided UI exploration
                 </span>
               )}
             </div>
@@ -1012,8 +1123,20 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
         <div className="flex items-center gap-2">
           <span className="text-[10px] uppercase tracking-wider text-neutral-500">Report</span>
           <Badge
-            label={report.analysisScope === "static_and_dynamic" ? "Static + Dynamic" : "Static Only"}
-            variant={report.analysisScope === "static_and_dynamic" ? "observed" : "capability"}
+            label={
+              report.analysisScope === "autonomous_dynamic"
+                ? "Autonomous Deep Dive"
+                : report.analysisScope === "static_and_dynamic"
+                ? "Static + Dynamic"
+                : "Static Only"
+            }
+            variant={
+              report.analysisScope === "autonomous_dynamic"
+                ? "observed"
+                : report.analysisScope === "static_and_dynamic"
+                ? "observed"
+                : "capability"
+            }
           />
         </div>
         <h2 className="text-[17px] font-medium text-neutral-100">{report.fileName}</h2>
@@ -1025,7 +1148,7 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
           <span>{report.executiveSummary}</span>
         ) : (
           <>
-            ARGUS performed {report.analysisScope === "static_and_dynamic" ? "static and dynamic" : "static"} analysis of{" "}
+            ARGUS performed {report.analysisScope === "static_and_dynamic" ? "static and dynamic" : report.analysisScope === "autonomous_dynamic" ? "autonomous dynamic" : "static"} analysis of{" "}
             <span className="text-neutral-100">{report.fileName}</span>. Risk score:{" "}
             <span className="text-neutral-100">{report.permissionScore}%</span> with{" "}
             <span className="text-neutral-100">{report.highRisk.length}</span> high-risk capabilities.
@@ -1132,18 +1255,18 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
       </div>
 
       {/* ==================== RUNTIME ANALYSIS ==================== */}
-      <div className={`rounded-lg border p-4 ${report.analysisScope === "static_and_dynamic" ? "border-emerald-500/10 bg-emerald-500/[0.02]" : "border-neutral-700/30 bg-neutral-800/20"}`}>
+      <div className={`rounded-lg border p-4 ${report.analysisScope !== "static_only" ? "border-emerald-500/10 bg-emerald-500/[0.02]" : "border-neutral-700/30 bg-neutral-800/20"}`}>
         <div className="mb-4 flex items-center gap-2">
-          <span className={`text-[11px] font-semibold uppercase tracking-wider ${report.analysisScope === "static_and_dynamic" ? "text-emerald-400" : "text-neutral-500"}`}>
+          <span className={`text-[11px] font-semibold uppercase tracking-wider ${report.analysisScope !== "static_only" ? "text-emerald-400" : "text-neutral-500"}`}>
             Runtime Analysis
           </span>
-          {report.analysisScope === "static_and_dynamic"
-            ? <Badge label="Observations" variant="observed" />
+          {report.analysisScope !== "static_only"
+            ? <Badge label={report.analysisScope === "autonomous_dynamic" ? "Autonomous Exploration" : "Observations"} variant="observed" />
             : <Badge label="Not Performed" variant="not-tested" />
           }
         </div>
 
-        {report.analysisScope !== "static_and_dynamic" ? (
+        {report.analysisScope === "static_only" ? (
           <div className="text-[12px] text-neutral-500">
             Dynamic analysis was not performed. No emulator was available.
             Runtime validation is required to confirm static capabilities.
@@ -1209,6 +1332,63 @@ function ReportView({ report }: { report: NonNullable<Report> }) {
           <div className="text-[12px] text-neutral-500">Behavior agent returned no findings.</div>
         )}
       </div>
+
+      {/* ==================== AUTONOMOUS EXPLORATION PANEL ==================== */}
+      {report.analysisScope === "autonomous_dynamic" && report.exploration && (
+        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.03] p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-emerald-400">
+              🤖 Autonomous Exploration
+            </span>
+            <Badge label="LLM-Driven" variant="observed" />
+          </div>
+
+          <div className="mb-4 grid grid-cols-3 gap-3">
+            <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-3 py-2">
+              <div className="text-[10px] text-neutral-500">Steps Executed</div>
+              <div className="text-[16px] font-semibold text-neutral-100">{report.exploration.total_steps}</div>
+            </div>
+            <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-3 py-2">
+              <div className="text-[10px] text-neutral-500">Screens Explored</div>
+              <div className="text-[16px] font-semibold text-emerald-400">{report.exploration.screens_explored}</div>
+            </div>
+            <div className="rounded-md border border-white/[0.06] bg-[#0a0a0c] px-3 py-2">
+              <div className="text-[10px] text-neutral-500">Elements Touched</div>
+              <div className="text-[16px] font-semibold text-emerald-300">{report.exploration.elements_touched}</div>
+            </div>
+          </div>
+
+          {report.exploration.frida_events_total != null && (
+            <div className="mb-3 flex items-center gap-2 text-[12px]">
+              <span className="text-neutral-500">Frida events captured during exploration:</span>
+              <span className="font-semibold text-neutral-100">{report.exploration.frida_events_total}</span>
+            </div>
+          )}
+
+          <div className="mb-3 flex items-center gap-2 text-[11px]">
+            <span className="text-neutral-500">Stop reason:</span>
+            <span className="font-mono text-emerald-300">{report.exploration.stop_reason}</span>
+          </div>
+
+          {report.exploration.activities_visited.length > 0 && (
+            <div>
+              <div className="mb-1.5 text-[10px] uppercase tracking-wider text-neutral-500">
+                Activities Visited ({report.exploration.activities_visited.length})
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {report.exploration.activities_visited.map((act, i) => (
+                  <span
+                    key={i}
+                    className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-300"
+                  >
+                    {act}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ==================== CORRELATION ANALYSIS ==================== */}
       {correlations.length > 0 && (

@@ -15,6 +15,54 @@ FRIDA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.fri
 # what the caller requested — prevents runaway APKs from blocking the queue.
 DYNAMIC_ANALYSIS_TIMEOUT = int(os.environ.get("ARGUS_DYNAMIC_TIMEOUT", "120"))
 
+class FridaStreamHandle:
+    """Live handle to a running Frida session.
+
+    Allows the autonomous explorer to poll new log lines as they arrive
+    (via the sandbox's ``on_frida_message`` callback), rather than
+    waiting for the full monitoring window to end.
+
+    Usage::
+
+        handle = sandbox.start_frida_session(pkg, apk)
+        while exploring:
+            new_events = handle.poll_new_logs()
+            # ... feed to LLM ...
+        all_logs = handle.all_logs()
+        handle.stop()
+    """
+
+    def __init__(self, sandbox: "SandboxOrchestrator", session, watchdog=None):
+        self._sandbox = sandbox
+        self._session = session
+        self._watchdog = watchdog  # threading.Timer or None
+        self._consumed_index: int = 0
+
+    def poll_new_logs(self) -> list[str]:
+        """Return log lines that arrived since the last poll, advancing the cursor."""
+        logs = self._sandbox.dynamic_logs
+        new = logs[self._consumed_index:]
+        self._consumed_index = len(logs)
+        return new
+
+    def all_logs(self) -> list[str]:
+        """Return ALL logs collected so far (does not advance cursor)."""
+        return list(self._sandbox.dynamic_logs)
+
+    def stop(self):
+        """Detach the Frida session and cancel the watchdog timer."""
+        if self._watchdog is not None:
+            try:
+                self._watchdog.cancel()
+            except Exception:
+                pass
+        if self._session is not None:
+            try:
+                self._session.detach()
+            except Exception:
+                pass
+
+
 class SandboxOrchestrator:
     def __init__(self):
         self.device = None
@@ -259,7 +307,22 @@ class SandboxOrchestrator:
         return content
 
     def _spawn_and_instrument(self, package_name, duration_seconds):
-        """Primary method: use Frida spawn to start the app in suspended mode, inject hooks, then resume."""
+        """Primary method: use Frida spawn, inject hooks, monitor for duration_seconds."""
+        session = self._spawn_and_instrument_session(package_name)
+        print(f"[Sandbox] Hooks loaded. Monitoring for {duration_seconds}s...")
+        time.sleep(duration_seconds)
+        return session
+
+    def _spawn_and_instrument_session(self, package_name):
+        """Setup Frida spawn + attach + hooks load — event-based handshake.
+
+        Returns the live ``frida.Session``. The caller is responsible for
+        waiting the desired duration and later detaching.
+
+        Uses a threading.Event to wait for the JS script to confirm it
+        loaded (``script_loaded`` message), then waits up to 15s for the
+        Java VM to become available (``hooks_injected`` or first hook log).
+        """
         print("[Sandbox] Spawning process via Frida (spawn + resume)...")
         self.device = frida.get_usb_device(timeout=5)
 
@@ -272,21 +335,74 @@ class SandboxOrchestrator:
         # Resume first so the ART/Dalvik VM initializes
         self.device.resume(pid)
         print(f"[Sandbox] Resumed PID {pid}. Waiting for Java VM to initialize...")
-        time.sleep(3)  # Give the VM time to start
+
+        # ---- Dismiss system dialogs that block app startup ----
+        # "App made for older version", compatibility warnings, etc.
+        # Press Enter twice (clicks default button on most dialogs), then wait
+        time.sleep(1.5)
+        for _ in range(3):
+            try:
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                    capture_output=True, timeout=3,
+                )
+                time.sleep(0.6)
+            except Exception:
+                pass
+        time.sleep(1)  # let the app start after dialog dismissal
+
+        # ---- Event-based handshake ----
+        script_loaded = threading.Event()
+        java_ready = threading.Event()
+
+        def _handshake_handler(message, data):
+            """Intercept early messages to detect script-loaded and Java-ready."""
+            # Still forward to the main handler
+            self.on_frida_message(message, data)
+            if message.get('type') == 'send':
+                payload = message.get('payload', {})
+                if isinstance(payload, dict):
+                    ptype = payload.get('type', '')
+                    pdata = payload.get('data', '')
+                    if ptype == 'status' and pdata == 'script_loaded':
+                        script_loaded.set()
+                    elif ptype == 'log' and isinstance(pdata, str):
+                        if 'Frida hooks injected successfully' in pdata:
+                            java_ready.set()
 
         # Now load hooks — Java runtime should be available
         script_code = self._load_hooks_script()
-        script = session.create_script(script_code, runtime='v8')
-        script.on('message', self.on_frida_message)
+        script = session.create_script(script_code)  # default QJS runtime — Java is a global
+        script.on('message', _handshake_handler)
         script.load()
 
-        print(f"[Sandbox] Hooks loaded. Monitoring for {duration_seconds}s...")
-        time.sleep(duration_seconds)
+        # Wait for script to confirm it loaded (max 10s)
+        if not script_loaded.wait(timeout=10):
+            print("[Sandbox] WARNING: script did not send script_loaded within 10s — proceeding anyway", flush=True)
+        else:
+            print("[Sandbox] Script loaded confirmation received.", flush=True)
+
+        # Wait for Java VM (max 15s after script loaded)
+        if not java_ready.wait(timeout=15):
+            print("[Sandbox] WARNING: Java VM did not become available within 15s — proceeding without Java hooks", flush=True)
+        else:
+            print("[Sandbox] Java VM ready — hooks injected.", flush=True)
 
         return session
 
     def _attach_with_retry(self, package_name, duration_seconds, max_retries=3):
         """Fallback method: launch via ADB then attach Frida by PID with retries."""
+        session = self._attach_with_retry_session(package_name, max_retries)
+        print(f"[Sandbox] Monitoring {package_name} for {duration_seconds}s...")
+        time.sleep(duration_seconds)
+        return session
+
+    def _attach_with_retry_session(self, package_name, max_retries=3):
+        """Setup ADB launch + Frida attach with retries — NO blocking sleep.
+
+        Returns the live ``frida.Session``. The caller is responsible for
+        waiting the desired duration and later detaching.
+        """
         print("[Sandbox] Falling back to ADB launch + Frida attach...")
 
         self.device = frida.get_usb_device(timeout=5)
@@ -324,12 +440,10 @@ class SandboxOrchestrator:
                 print(f"[Sandbox] Attached to PID {pid}")
 
                 script_code = self._load_hooks_script()
-                script = session.create_script(script_code, runtime='v8')
+                script = session.create_script(script_code)  # default QJS runtime — Java is a global
                 script.on('message', self.on_frida_message)
                 script.load()
 
-                print(f"[Sandbox] Monitoring {package_name} for {duration_seconds}s...")
-                time.sleep(duration_seconds)
                 return session
             except frida.ProcessNotFoundError:
                 pid = None  # Reset so we re-check on next attempt
@@ -431,6 +545,68 @@ class SandboxOrchestrator:
             "timed_out": timed_out,
             "logs": self.dynamic_logs,
         }
+
+    def start_frida_session(self, package_name, apk_path, max_seconds=330):
+        """Start a streaming Frida session and return a live handle.
+
+        Installs the APK, spawns + instruments with Frida hooks, and returns
+        a ``FridaStreamHandle`` that the caller can poll via ``poll_new_logs()``
+        while the app is running.  The caller MUST call ``handle.stop()`` when
+        done, which detaches the session and cancels the watchdog.
+
+        Returns a dict:
+            {"success": bool, "handle": FridaStreamHandle | None, "error": str}
+        """
+        self.dynamic_logs = []
+        self._abort_event.clear()
+
+        if not self.check_emulator():
+            return {"success": False, "handle": None, "error": "No emulator connected"}
+
+        # 0. Ensure frida-server is running
+        self.ensure_frida_server()
+
+        # 0b. Clear previous app state
+        self.cleanup_app_state(package_name)
+
+        # 1. Install
+        if not self.install_apk(apk_path):
+            return {"success": False, "handle": None, "error": "Failed to install APK"}
+
+        # Start global watchdog
+        watchdog_fired = [False]  # mutable container for the Timer closure
+
+        def _watchdog():
+            print(f"[Sandbox] WATCHDOG: Frida session exceeded {max_seconds}s — forcing abort", flush=True)
+            self.dynamic_logs.append(f"WATCHDOG: analysis killed after {max_seconds}s")
+            self._abort_event.set()
+            watchdog_fired[0] = True
+
+        watchdog = threading.Timer(max_seconds, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+
+        # 2. Instrument
+        session = None
+        try:
+            session = self._spawn_and_instrument_session(package_name)
+        except Exception as spawn_err:
+            print(f"[Sandbox] Frida spawn failed ({spawn_err}), trying fallback...")
+            try:
+                session = self._attach_with_retry_session(package_name)
+            except frida.ProcessNotFoundError:
+                print("[Sandbox] Frida could not find the running process after retries.")
+                self.dynamic_logs.append("Frida: Process exited or crashed before attachment.")
+                watchdog.cancel()
+                return {"success": False, "handle": None, "error": "Process not found"}
+            except Exception as e:
+                print(f"[Sandbox] Frida Error: {e}")
+                self.dynamic_logs.append(f"Sandbox Error: {e}")
+                watchdog.cancel()
+                return {"success": False, "handle": None, "error": str(e)}
+
+        handle = FridaStreamHandle(self, session, watchdog)
+        return {"success": True, "handle": handle, "error": ""}
 
 if __name__ == "__main__":
     # Test script standalone
