@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -10,7 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+# Copy all application source into the image.
+# The DB and artifacts are intentionally NOT copied — they live on
+# the named Docker volume mounted at /data at runtime.
+COPY . .
 
-EXPOSE 5000
+# Create the data directory that the named volume will be mounted over.
+# This ensures the path exists even before the volume is attached.
+RUN mkdir -p /data/artifacts
+
+EXPOSE 5050
 CMD ["python", "app.py"]

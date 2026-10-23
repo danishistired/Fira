@@ -384,14 +384,14 @@ class InvestigationMemory:
             sections.append(f"- MEDIUM signal: {len(medium)} findings")
 
             for a in high[:5]:
-                sections.append(f"  - [HIGH] {a['description']}: {a['api']} in {a['file']}")
+                sections.append(f"  - [HIGH] {a.get('description','')}: {a.get('api','')} in {a.get('file','unknown')}")
             for a in medium[:3]:
-                sections.append(f"  - [MEDIUM] {a['description']}: {a['api']} in {a['file']}")
+                sections.append(f"  - [MEDIUM] {a.get('description','')}: {a.get('api','')} in {a.get('file','unknown')}")
 
             if self.hardcoded_secrets:
                 sections.append(f"- Hardcoded secrets: {len(self.hardcoded_secrets)}")
                 for s in self.hardcoded_secrets[:3]:
-                    sections.append(f"  - {s['type']} in {s['file']}")
+                    sections.append(f"  - {s.get('type','unknown')} in {s.get('file', s.get('value','unknown'))}")
 
         if self.coverage["apktool_resources"]:
             apktool_out = self.tool_outputs.get("run_apktool", {})

@@ -16,6 +16,9 @@ FRIDA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.fri
 # what the caller requested — prevents runaway APKs from blocking the queue.
 DYNAMIC_ANALYSIS_TIMEOUT = int(os.environ.get("ARGUS_DYNAMIC_TIMEOUT", "120"))
 
+
+from shared.adb import ADB
+
 class FridaStreamHandle:
     """Live handle to a running Frida session.
 
@@ -174,17 +177,17 @@ class SandboxOrchestrator:
     def check_emulator(self):
         """Check if an Android emulator is connected via adb."""
         try:
-            result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=5)
-            lines = result.stdout.strip().split("\n")[1:] # Skip first line "List of devices attached"
-            
-            devices = [line.split("\t")[0] for line in lines if "device" in line and not "offline" in line]
+            result = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
+            lines = result.stdout.strip().split("\n")[1:]  # Skip first line "List of devices attached"
+
+            devices = [line.split("\t")[0] for line in lines if "device" in line and "offline" not in line]
             if devices:
                 print(f"[Sandbox] Found emulator/device: {devices[0]}")
                 return True
             print("[Sandbox] No active emulator found.")
             return False
         except FileNotFoundError:
-            print("[Sandbox] ADB not found in PATH.")
+            print(f"[Sandbox] ADB not found (tried: {ADB}). Set ADB_PATH env var to override.")
             return False
         except Exception as e:
             print(f"[Sandbox] ADB check failed: {e}")
@@ -197,7 +200,7 @@ class SandboxOrchestrator:
         while time.time() < deadline:
             try:
                 result = subprocess.run(
-                    ["adb", "shell", "getprop", "sys.boot_completed"],
+                    [ADB, "shell", "getprop", "sys.boot_completed"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if result.stdout.strip() == "1":
@@ -219,7 +222,7 @@ class SandboxOrchestrator:
         print(f"[Sandbox] Clearing app data for {package_name}...", flush=True)
         try:
             subprocess.run(
-                ["adb", "shell", "pm", "clear", package_name],
+                [ADB, "shell", "pm", "clear", package_name],
                 capture_output=True, text=True, timeout=10,
             )
         except Exception as e:
@@ -228,7 +231,7 @@ class SandboxOrchestrator:
     def _get_device_arch(self):
         """Get the CPU architecture of the connected device/emulator."""
         result = subprocess.run(
-            ["adb", "shell", "getprop", "ro.product.cpu.abi"],
+            [ADB, "shell", "getprop", "ro.product.cpu.abi"],
             capture_output=True, text=True, timeout=5
         )
         abi = result.stdout.strip()
@@ -247,7 +250,7 @@ class SandboxOrchestrator:
         """Check if frida-server is already running on the device."""
         try:
             result = subprocess.run(
-                ["adb", "shell", "ps -A | grep frida"],
+                [ADB, "shell", "ps -A | grep frida"],
                 capture_output=True, text=True, timeout=5, shell=False
             )
             return "frida" in result.stdout.lower()
@@ -266,7 +269,7 @@ class SandboxOrchestrator:
 
         # Ensure root access
         try:
-            root_result = subprocess.run(["adb", "root"], capture_output=True, text=True, timeout=10)
+            root_result = subprocess.run([ADB, "root"], capture_output=True, text=True, timeout=10)
             print(f"[Sandbox] ADB root: {root_result.stdout.strip()}")
             time.sleep(2)  # Wait for adbd restart
         except Exception as e:
@@ -303,9 +306,9 @@ class SandboxOrchestrator:
         device_path = "/data/local/tmp/frida-server"
         print(f"[Sandbox] Pushing frida-server to {device_path}...")
         try:
-            subprocess.run(["adb", "push", local_binary, device_path],
+            subprocess.run([ADB, "push", local_binary, device_path],
                           capture_output=True, text=True, timeout=30)
-            subprocess.run(["adb", "shell", f"chmod 755 {device_path}"],
+            subprocess.run([ADB, "shell", f"chmod 755 {device_path}"],
                           capture_output=True, text=True, timeout=5)
         except Exception as e:
             print(f"[Sandbox] Failed to push frida-server: {e}")
@@ -315,7 +318,7 @@ class SandboxOrchestrator:
         print("[Sandbox] Starting frida-server on device...")
         try:
             subprocess.Popen(
-                ["adb", "shell", f"{device_path} -D &"],
+                [ADB, "shell", f"{device_path} -D &"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(2)  # Give it a moment to start
@@ -334,7 +337,7 @@ class SandboxOrchestrator:
         """Install APK via ADB."""
         print(f"[Sandbox] Installing APK: {apk_path}...")
         try:
-            result = subprocess.run(["adb", "install", "-r", "-g", apk_path], capture_output=True, text=True, timeout=60)
+            result = subprocess.run([ADB, "install", "-r", "-g", apk_path], capture_output=True, text=True, timeout=60)
             if "Success" in result.stdout:
                 print("[Sandbox] Install successful.")
                 return True
@@ -349,7 +352,7 @@ class SandboxOrchestrator:
         """Uninstall APK via ADB."""
         print(f"[Sandbox] Uninstalling {package_name}...")
         try:
-            subprocess.run(["adb", "uninstall", package_name], capture_output=True, timeout=10)
+            subprocess.run([ADB, "uninstall", package_name], capture_output=True, timeout=10)
         except Exception:
             pass
 
@@ -358,13 +361,13 @@ class SandboxOrchestrator:
         print(f"[Sandbox] Launching {package_name}...")
         try:
             subprocess.run(
-                ["adb", "shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"],
+                [ADB, "shell", "monkey", "-p", package_name, "-c", "android.intent.category.LAUNCHER", "1"],
                 capture_output=True, timeout=10
             )
             time.sleep(3)  # Give it a moment to start
             # Verify the process is actually running and get its PID
             check = subprocess.run(
-                ["adb", "shell", "pidof", package_name],
+                [ADB, "shell", "pidof", package_name],
                 capture_output=True, text=True, timeout=5
             )
             pid_str = check.stdout.strip()
@@ -444,7 +447,7 @@ class SandboxOrchestrator:
         for _ in range(3):
             try:
                 subprocess.run(
-                    ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                    [ADB, "shell", "input", "keyevent", "KEYCODE_ENTER"],
                     capture_output=True, timeout=3,
                 )
                 time.sleep(0.6)
@@ -525,7 +528,7 @@ class SandboxOrchestrator:
             if pid is None:
                 try:
                     check = subprocess.run(
-                        ["adb", "shell", "pidof", package_name],
+                        [ADB, "shell", "pidof", package_name],
                         capture_output=True, text=True, timeout=5
                     )
                     pid_str = check.stdout.strip()
@@ -741,7 +744,7 @@ class SandboxOrchestrator:
         # causes infinite dismiss loops. Disabling it is the cleanest fix.
         try:
             subprocess.run(
-                ["adb", "shell", "settings", "put", "secure", "autofill_service", "null"],
+                [ADB, "shell", "settings", "put", "secure", "autofill_service", "null"],
                 capture_output=True, timeout=5,
             )
             print("[Sandbox] Disabled Android Autofill service", flush=True)
@@ -754,7 +757,7 @@ class SandboxOrchestrator:
         for nuisance_pkg in ("host.exp.exponent",):
             try:
                 subprocess.run(
-                    ["adb", "shell", "am", "force-stop", nuisance_pkg],
+                    [ADB, "shell", "am", "force-stop", nuisance_pkg],
                     capture_output=True, timeout=5,
                 )
             except Exception:
@@ -773,7 +776,7 @@ class SandboxOrchestrator:
             try:
                 # Press Enter (clicks default button on most dialogs)
                 subprocess.run(
-                    ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                    [ADB, "shell", "input", "keyevent", "KEYCODE_ENTER"],
                     capture_output=True, timeout=3,
                 )
             except Exception:
@@ -788,13 +791,13 @@ class SandboxOrchestrator:
             try:
                 # Check if the target app is the current foreground activity
                 fg_check = subprocess.run(
-                    ["adb", "shell", "dumpsys", "activity", "activities"],
+                    [ADB, "shell", "dumpsys", "activity", "activities"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if package_name in fg_check.stdout and "mResumedActivity" in fg_check.stdout:
                     # Also verify PID is still alive
                     pid_check = subprocess.run(
-                        ["adb", "shell", "pidof", package_name],
+                        [ADB, "shell", "pidof", package_name],
                         capture_output=True, text=True, timeout=5,
                     )
                     pid_str = pid_check.stdout.strip()
@@ -810,7 +813,7 @@ class SandboxOrchestrator:
             # Fallback: just check PID
             try:
                 check = subprocess.run(
-                    ["adb", "shell", "pidof", package_name],
+                    [ADB, "shell", "pidof", package_name],
                     capture_output=True, text=True, timeout=5,
                 )
                 pid_str = check.stdout.strip()
@@ -827,7 +830,7 @@ class SandboxOrchestrator:
                     # Dismiss dialogs again
                     for _ in range(3):
                         subprocess.run(
-                            ["adb", "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                            [ADB, "shell", "input", "keyevent", "KEYCODE_ENTER"],
                             capture_output=True, timeout=3,
                         )
                         time.sleep(0.5)
@@ -846,7 +849,7 @@ class SandboxOrchestrator:
         # ---- Verify PID is alive right before attach ----
         try:
             check = subprocess.run(
-                ["adb", "shell", "pidof", package_name],
+                [ADB, "shell", "pidof", package_name],
                 capture_output=True, text=True, timeout=5,
             )
             pid_str = check.stdout.strip()

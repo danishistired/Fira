@@ -2,9 +2,17 @@ services:
   analysis:
     build: ./analysis
     ports:
-      - "5000:5000"
+      - "5050:5050"
+    environment:
+      # DB and artifacts live on a named volume — proper Linux fs, WAL works fine
+      - ARGUS_DB_PATH=/data/argus.db
+      - ARGUS_ARTIFACTS_DIR=/data/artifacts
     volumes:
-      - ./analysis:/app
+      # Named volume for persistent data (DB + scan artifacts).
+      # Named volumes use Docker's own ext4 storage → SQLite WAL is fully supported.
+      - argus_data:/data
+    depends_on:
+      - mobsf
 
   mobsf:
     image: opensecurity/mobile-security-framework-mobsf:latest
@@ -13,3 +21,5 @@ services:
     environment:
       - MOBSF_API_KEY=argus_mobsf_key_12345
 
+volumes:
+  argus_data:

@@ -54,7 +54,18 @@ DATABASE_URL = _build_database_url()
 # SQLite-specific: enable WAL mode and foreign keys for concurrent reads
 def _configure_sqlite(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+    except Exception as exc:  # noqa: BLE001
+        # WAL mode is unsupported on some Docker volume drivers (overlay2, NFS,
+        # tmpfs-backed mounts).  Fall back to the default DELETE journal mode so
+        # the application can still start.  Log a warning so the operator knows.
+        logger.warning(
+            "[DB] Could not enable WAL mode (%s). "
+            "Falling back to default journal mode. "
+            "Consider mounting the DB directory as a named Docker volume.",
+            exc,
+        )
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
