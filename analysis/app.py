@@ -342,37 +342,67 @@ def analyze_apk_stream():
 
 @app.route('/chat', methods=['POST'])
 def chat_followup():
-    """Handle follow-up questions about a completed analysis using DeepSeek."""
+    """Handle follow-up questions about a completed analysis using DeepSeek.
+
+    Accepts:
+        question (str): The user's question
+        report_context (dict): The full analysis report from the frontend
+        conversation_history (list): Previous messages [{role, content}, ...] for multi-turn context
+        job_id (str, optional): If provided, loads full result from DB for richer context
+    """
     if not llm_client:
         return jsonify({'answer': 'LLM is not configured. Set DEEPSEEK_API_KEY in .env'}), 200
 
     data = request.get_json(silent=True) or {}
     question = data.get('question', '').strip()
     report_context = data.get('report_context', {})
+    conversation_history = data.get('conversation_history', [])
+    job_id = data.get('job_id', '')
 
     if not question:
         return jsonify({'error': 'No question provided'}), 400
 
     from engine.prompts import CHAT_SYSTEM_PROMPT
 
-    ctx_parts = [f"**Package**: {report_context.get('package', 'unknown')}"]
-    scope = report_context.get('analysisScope', 'static_only')
-    ctx_parts.append(f"**Analysis Scope**: {'Static + Dynamic' if scope == 'static_and_dynamic' else 'Static Only'}")
+    # --- Build rich analysis context ---
+    ctx_parts = []
+
+    # Try to load full result from DB if job_id is provided
+    if job_id:
+        try:
+            job = get_job(job_id)
+            if job and job.get('result_json'):
+                full_result = job['result_json'] if isinstance(job['result_json'], dict) else json.loads(job['result_json'])
+                report_context = {**full_result, **report_context}  # merge, frontend overrides
+        except Exception as e:
+            print(f"[chat] Could not load job {job_id}: {e}", flush=True)
+
+    ctx_parts.append(f"**Package**: {report_context.get('package', report_context.get('package_name', 'unknown'))}")
+    scope = report_context.get('analysisScope', report_context.get('analysis_scope', 'static_only'))
+    ctx_parts.append(f"**Analysis Scope**: {'Static + Dynamic' if 'dynamic' in str(scope) else 'Static Only'}")
 
     if report_context.get('verdict'):
         ctx_parts.append(f"**Verdict**: {report_context['verdict']} ({report_context.get('confidence', '?')}% confidence)")
-    if report_context.get('confidenceBreakdown'):
-        ctx_parts.append(f"**Confidence Breakdown**: {report_context['confidenceBreakdown']}")
-    if report_context.get('executiveSummary'):
-        ctx_parts.append(f"**Executive Summary**: {report_context['executiveSummary']}")
-    if report_context.get('highRisk'):
-        ctx_parts.append(f"**High-Risk Permissions (capabilities)**: {', '.join(report_context['highRisk'])}")
+    if report_context.get('confidenceBreakdown') or report_context.get('confidence_breakdown'):
+        ctx_parts.append(f"**Confidence Breakdown**: {report_context.get('confidenceBreakdown', report_context.get('confidence_breakdown', ''))}")
+    if report_context.get('executiveSummary') or report_context.get('executive_summary'):
+        ctx_parts.append(f"**Executive Summary**: {report_context.get('executiveSummary', report_context.get('executive_summary', ''))}")
+    if report_context.get('analystSummary') or report_context.get('analyst_summary'):
+        ctx_parts.append(f"**Analyst Summary**: {report_context.get('analystSummary', report_context.get('analyst_summary', ''))}")
+    if report_context.get('recommendedActions') or report_context.get('recommended_actions'):
+        ctx_parts.append(f"**Recommended Actions**: {report_context.get('recommendedActions', report_context.get('recommended_actions', ''))}")
 
-    if report_context.get('apiCalls'):
-        app_apis = [a for a in report_context['apiCalls'][:10] if not a.get('is_library')]
+    if report_context.get('highRisk') or report_context.get('high_risk_permissions'):
+        perms = report_context.get('highRisk', report_context.get('high_risk_permissions', []))
+        if perms:
+            ctx_parts.append(f"**High-Risk Permissions**: {', '.join(perms)}")
+
+    if report_context.get('apiCalls') or report_context.get('api_calls'):
+        api_calls = report_context.get('apiCalls', report_context.get('api_calls', []))
+        app_apis = [a for a in api_calls[:15] if not a.get('is_library')]
         if app_apis:
-            apis = [f"{a['api']} in {a['file']}" for a in app_apis]
-            ctx_parts.append(f"**App Code APIs (capabilities)**: {', '.join(apis)}")
+            apis = [f"`{a['api']}` in `{a['file']}`" for a in app_apis]
+            ctx_parts.append(f"**App Code API Calls**:\n" + "\n".join(f"- {a}" for a in apis))
 
     if report_context.get('correlations'):
         validated = [c for c in report_context['correlations'] if c.get('status') == 'VALIDATED']
@@ -382,36 +412,73 @@ def chat_followup():
         if not_validated:
             ctx_parts.append(f"**Not Validated (code exists, not observed)**: {', '.join(c['capability'] for c in not_validated)}")
 
-    if report_context.get('mitreTechniques'):
-        ctx_parts.append(f"**MITRE ATT&CK**: {', '.join(report_context['mitreTechniques'])}")
+    if report_context.get('mitreTechniques') or report_context.get('mitre_techniques'):
+        techniques = report_context.get('mitreTechniques', report_context.get('mitre_techniques', []))
+        if techniques:
+            ctx_parts.append(f"**MITRE ATT&CK**: {', '.join(techniques)}")
 
-    if report_context.get('agentFindings'):
-        for agent_id, finding in report_context['agentFindings'].items():
-            summary = finding.get('summary', '')
-            ctx_parts.append(f"**{agent_id.title()} Agent**: {summary}")
+    if report_context.get('agentFindings') or report_context.get('agent_findings'):
+        findings = report_context.get('agentFindings', report_context.get('agent_findings', {}))
+        for agent_id, finding in findings.items():
+            if isinstance(finding, dict):
+                summary = finding.get('summary', '')
+                detail_findings = finding.get('findings', [])
+                agent_block = f"**{agent_id.title()} Agent**: {summary}"
+                if detail_findings:
+                    for df in detail_findings[:5]:
+                        if isinstance(df, dict):
+                            evidence = df.get('evidence', '')
+                            interp = df.get('interpretation', '')
+                            conf = df.get('confidence', '')
+                            validation = df.get('runtime_validation', '')
+                            agent_block += f"\n  - [{conf}] {evidence}: {interp} (Runtime: {validation})"
+                ctx_parts.append(agent_block)
 
-    if report_context.get('recommendedActions'):
-        ctx_parts.append(f"**Recommended Actions**: {report_context['recommendedActions']}")
+    if report_context.get('yaraRule') or report_context.get('yara_rule'):
+        yara = report_context.get('yaraRule', report_context.get('yara_rule', ''))
+        if yara:
+            ctx_parts.append(f"**YARA Rule**:\n```yara\n{yara}\n```")
 
-    context = "\n".join(ctx_parts)
+    # Include investigation timeline if available
+    if report_context.get('investigation_timeline'):
+        timeline_entries = report_context['investigation_timeline'][:10]
+        timeline_text = "\n".join(f"  - {entry}" if isinstance(entry, str) else f"  - {entry.get('tool', '?')}: {entry.get('result_summary', '')}" for entry in timeline_entries)
+        ctx_parts.append(f"**Investigation Timeline**:\n{timeline_text}")
+
+    context = "\n\n".join(ctx_parts)
 
     try:
         print(f"[chat] Question: {question[:100]}", flush=True)
+        print(f"[chat] History messages: {len(conversation_history)}", flush=True)
+
+        # Build message list: system → context → conversation history → current question
         messages = [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"## Analysis Context\n{context}\n\n## User Question\n{question}"},
+            {"role": "user", "content": f"## Full Analysis Report Context\n\n{context}\n\n---\n\n*The above is the complete analysis context. Use it to answer the user's questions below.*"},
+            {"role": "assistant", "content": "Understood. I have the full analysis context loaded. I'll reference specific evidence from the report in my answers and use rich markdown formatting. Ask me anything about this APK."},
         ]
+
+        # Add conversation history (limit to last 10 exchanges to stay within context window)
+        for msg in conversation_history[-20:]:
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+            if role in ('user', 'assistant') and content:
+                messages.append({"role": role, "content": content})
+
+        # Add the current question
+        messages.append({"role": "user", "content": question})
+
         log_llm_prompt("Chat Assistant", messages)
 
         response = llm_client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=messages,
             temperature=0.3,
-            max_tokens=500,
+            max_tokens=4096,
         )
         answer = response.choices[0].message.content.strip()
         answer = enforce_language_rules(answer)
-        print(f"[chat] Answer: {answer[:100]}...", flush=True)
+        print(f"[chat] Answer length: {len(answer)} chars", flush=True)
         return jsonify({'answer': answer})
 
     except Exception as e:

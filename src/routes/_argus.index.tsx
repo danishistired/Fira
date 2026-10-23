@@ -16,7 +16,13 @@ import {
   Zap,
   Shield,
   Bot,
+  Copy,
+  CheckCheck,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 export const Route = createFileRoute("/_argus/")({
   head: () => ({ meta: [{ title: "ARGUS" }] }),
@@ -606,7 +612,7 @@ export function Home() {
       messages: [
         ...c.messages,
         { id: newId(), role: "user", text },
-        { id: thinkingId, role: "assistant", text: "Thinking…" },
+        { id: thinkingId, role: "assistant", text: "__THINKING__" },
       ],
     }));
 
@@ -621,7 +627,7 @@ export function Home() {
                   m.id === thinkingId
                     ? { ...m, text: active?.status === "analyzing"
                         ? "Analysis is still running. I'll have a complete answer once the agents converge."
-                        : "Upload an APK with the + button and I'll begin a multi-agent analysis." }
+                        : "Upload an APK with the **+** button and I'll begin a multi-agent analysis." }
                     : m,
                 ),
               }
@@ -632,12 +638,19 @@ export function Home() {
     }
 
     try {
+      // Build conversation history from previous messages (excluding the current thinking placeholder)
+      const history = active.messages
+        .filter((m) => m.text !== "__THINKING__")
+        .map((m) => ({ role: m.role, content: m.text }));
+
       const resp = await fetch("http://localhost:5050/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: text,
           report_context: active.report,
+          conversation_history: history,
+          job_id: active.jobId ?? "",
         }),
       });
       const data = await resp.json();
@@ -779,12 +792,13 @@ export function Home() {
               <EmptyState />
             ) : (
               <div className="space-y-8">
-                {active.messages.map((m, i) =>
-                  m.role === "user" ? (
-                    <UserMessage key={m.id} text={m.text} />
+                {/* Initial analysis message (first message from upload) */}
+                {active.messages.length > 0 && (
+                  active.messages[0].role === "user" ? (
+                    <UserMessage key={active.messages[0].id} text={active.messages[0].text} />
                   ) : (
-                    <AssistantMessage key={m.id} text={m.text} />
-                  ),
+                    <AssistantMessage key={active.messages[0].id} text={active.messages[0].text} />
+                  )
                 )}
 
                 {(active.status === "analyzing" || active.timeline.length > 0) && (
@@ -792,6 +806,15 @@ export function Home() {
                 )}
 
                 {active.report && <ReportView report={active.report} />}
+
+                {/* Follow-up chat messages — rendered AFTER the report so they're visible at the bottom */}
+                {active.messages.length > 1 && active.messages.slice(1).map((m) =>
+                  m.role === "user" ? (
+                    <UserMessage key={m.id} text={m.text} />
+                  ) : (
+                    <AssistantMessage key={m.id} text={m.text} />
+                  ),
+                )}
               </div>
             )}
           </div>
@@ -959,15 +982,151 @@ function UserMessage({ text }: { text: string }) {
   );
 }
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={() => {
+        navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }}
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-neutral-400 transition hover:bg-white/[0.08] hover:text-neutral-200"
+      title="Copy code"
+    >
+      {copied ? <CheckCheck size={12} className="text-emerald-400" /> : <Copy size={12} />}
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+function ThinkingIndicator() {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="flex items-center gap-3 py-2"
+    >
+      <div className="flex items-center gap-1.5">
+        <motion.div
+          className="h-1.5 w-1.5 rounded-full bg-indigo-400"
+          animate={{ scale: [1, 1.4, 1], opacity: [0.5, 1, 0.5] }}
+          transition={{ duration: 1.2, repeat: Infinity, delay: 0 }}
+        />
+        <motion.div
+          className="h-1.5 w-1.5 rounded-full bg-indigo-400"
+          animate={{ scale: [1, 1.4, 1], opacity: [0.5, 1, 0.5] }}
+          transition={{ duration: 1.2, repeat: Infinity, delay: 0.2 }}
+        />
+        <motion.div
+          className="h-1.5 w-1.5 rounded-full bg-indigo-400"
+          animate={{ scale: [1, 1.4, 1], opacity: [0.5, 1, 0.5] }}
+          transition={{ duration: 1.2, repeat: Infinity, delay: 0.4 }}
+        />
+      </div>
+      <span className="text-[12px] text-neutral-500">ARGUS is thinking…</span>
+    </motion.div>
+  );
+}
+
 function AssistantMessage({ text }: { text: string }) {
+  if (text === "__THINKING__") {
+    return <ThinkingIndicator />;
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.25 }}
-      className="text-[13px] leading-7 text-neutral-200"
+      className="argus-markdown text-[13px] leading-7 text-neutral-200"
     >
-      {text}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => (
+            <h1 className="mb-3 mt-4 border-b border-white/[0.08] pb-2 text-[18px] font-semibold text-neutral-100">
+              {children}
+            </h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="mb-2.5 mt-4 border-b border-white/[0.06] pb-1.5 text-[16px] font-semibold text-neutral-100">
+              {children}
+            </h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="mb-2 mt-3 text-[14px] font-semibold text-neutral-100">{children}</h3>
+          ),
+          p: ({ children }) => <p className="mb-3 leading-7">{children}</p>,
+          strong: ({ children }) => <strong className="font-semibold text-neutral-100">{children}</strong>,
+          em: ({ children }) => <em className="text-neutral-300">{children}</em>,
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 underline decoration-indigo-400/30 hover:decoration-indigo-400">
+              {children}
+            </a>
+          ),
+          ul: ({ children }) => <ul className="mb-3 ml-4 list-disc space-y-1 marker:text-neutral-600">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-3 ml-4 list-decimal space-y-1 marker:text-neutral-500">{children}</ol>,
+          li: ({ children }) => <li className="leading-7">{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="my-3 rounded-r-md border-l-2 border-indigo-500/50 bg-indigo-500/[0.06] py-2 pl-4 pr-3 text-[13px] text-neutral-300">
+              {children}
+            </blockquote>
+          ),
+          hr: () => <hr className="my-4 border-white/[0.08]" />,
+          table: ({ children }) => (
+            <div className="my-3 overflow-x-auto rounded-lg border border-white/[0.08]">
+              <table className="w-full text-[12px]">{children}</table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="border-b border-white/[0.08] bg-white/[0.03]">{children}</thead>,
+          tbody: ({ children }) => <tbody className="divide-y divide-white/[0.05]">{children}</tbody>,
+          tr: ({ children }) => <tr className="hover:bg-white/[0.02] transition">{children}</tr>,
+          th: ({ children }) => (
+            <th className="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => <td className="px-3 py-2 text-neutral-300">{children}</td>,
+          code: ({ className, children, ...props }) => {
+            const match = /language-(\w+)/.exec(className || "");
+            const codeString = String(children).replace(/\n$/, "");
+            if (match) {
+              return (
+                <div className="group my-3 overflow-hidden rounded-lg border border-white/[0.08] bg-[#0d0d12]">
+                  <div className="flex items-center justify-between border-b border-white/[0.06] bg-white/[0.02] px-3 py-1.5">
+                    <span className="text-[10px] font-medium uppercase tracking-wider text-neutral-500">
+                      {match[1]}
+                    </span>
+                    <CopyButton text={codeString} />
+                  </div>
+                  <SyntaxHighlighter
+                    style={oneDark}
+                    language={match[1]}
+                    PreTag="div"
+                    customStyle={{
+                      margin: 0,
+                      padding: "12px 16px",
+                      background: "transparent",
+                      fontSize: "12px",
+                      lineHeight: "1.6",
+                    }}
+                  >
+                    {codeString}
+                  </SyntaxHighlighter>
+                </div>
+              );
+            }
+            return (
+              <code className="rounded bg-white/[0.08] px-1.5 py-0.5 font-mono text-[12px] text-indigo-300" {...props}>
+                {children}
+              </code>
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
     </motion.div>
   );
 }
