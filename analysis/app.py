@@ -63,6 +63,7 @@ from engine.dynamic_only_orchestrator import DynamicOnlyOrchestrator
 from engine.autonomous_orchestrator import AutonomousOrchestrator
 from tools.registry import ToolRegistry
 from shared.language import enforce_language_rules, log_llm_prompt
+from shared.constants import ARGUS_TEMP_DIR
 from pathlib import Path
 
 # ---------- Phase 3: DB + Artifact Store ----------
@@ -150,7 +151,7 @@ def analyze_apk():
         return jsonify({'error': 'empty filename'}), 400
 
     # Save uploaded file to temp location
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk')
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk', dir=ARGUS_TEMP_DIR)
     os.close(tmp_fd)
 
     try:
@@ -234,7 +235,7 @@ def analyze_apk_stream():
     analysis_mode = request.form.get("mode", "full")  # 'full' or 'dynamic_only'
 
     # Save to temp file before streaming starts
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk')
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.apk', dir=ARGUS_TEMP_DIR)
     os.close(tmp_fd)
     f.save(tmp_path)
 

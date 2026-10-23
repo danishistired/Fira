@@ -8,7 +8,14 @@ the tool layer and evidence preprocessing.
 No logic lives here — just data definitions.
 """
 
+import os
 import re
+
+# ---------- Temp / Cache Directory ----------
+# Route all temporary files to D: drive to avoid filling the C: system drive.
+# Falls back to the system default if D:\argus-temp doesn't exist / can't be created.
+ARGUS_TEMP_DIR = os.path.join("D:\\", "argus-temp")
+os.makedirs(ARGUS_TEMP_DIR, exist_ok=True)
 
 # ---------- High-Risk Permission Set ----------
 # These permissions represent capabilities that are commonly abused by malware.
