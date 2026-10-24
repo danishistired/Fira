@@ -396,7 +396,12 @@ class InvestigationOrchestrator:
                     temperature=0.2 + (attempt - 1) * 0.1,
                     max_tokens=8000,  # reasoner adds CoT before the JSON answer
                 )
-                raw = response.choices[0].message.content.strip()
+                msg = response.choices[0].message
+                # deepseek-reasoner separates CoT (reasoning_content) from the JSON answer
+                # (content). content can be None if the model exhausted its token budget
+                # on reasoning — fall back to reasoning_content in that case.
+                raw_content = msg.content or getattr(msg, "reasoning_content", None) or ""
+                raw = raw_content.strip()
                 print(f"[Orchestrator] Consensus received ({len(raw)} chars)", flush=True)
 
                 consensus = parse_llm_json(raw)

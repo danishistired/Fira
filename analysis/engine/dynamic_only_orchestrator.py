@@ -280,7 +280,9 @@ class DynamicOnlyOrchestrator:
                 temperature=0.2,
                 max_tokens=8000,
             )
-            raw = response.choices[0].message.content.strip()
+            msg = response.choices[0].message
+            raw_content = msg.content or getattr(msg, "reasoning_content", None) or ""
+            raw = raw_content.strip()
             parsed = parse_llm_json(raw)
             if parsed and "verdict" in parsed:
                 return parsed
