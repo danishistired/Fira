@@ -278,11 +278,9 @@ class DynamicOnlyOrchestrator:
                 model="deepseek-reasoner",
                 messages=messages,
                 temperature=0.2,
-                max_tokens=8000,
+                max_tokens=16384,
             )
-            msg = response.choices[0].message
-            raw_content = msg.content or getattr(msg, "reasoning_content", None) or ""
-            raw = raw_content.strip()
+            raw = (response.choices[0].message.content or "").strip()
             parsed = parse_llm_json(raw)
             if parsed and "verdict" in parsed:
                 return parsed
