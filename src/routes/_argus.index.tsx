@@ -18,6 +18,8 @@ import {
   Bot,
   Copy,
   CheckCheck,
+  Pencil,
+  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -690,6 +692,43 @@ export function Home() {
     setDrawerOpen(false);
   };
 
+  const deleteConversation = (id: string) => {
+    setConversations((list) => {
+      const next = list.filter((c) => c.id !== id);
+      if (next.length === 0) {
+        const fresh = makeConversation("Untitled analysis");
+        setActiveId(fresh.id);
+        return [fresh];
+      }
+      if (id === activeId) {
+        setActiveId(next[0].id);
+      }
+      return next;
+    });
+  };
+
+  // ---------- inline rename state ----------
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
+  const startRename = (id: string, currentTitle: string) => {
+    setRenamingId(id);
+    setRenameValue(currentTitle);
+  };
+
+  const commitRename = () => {
+    if (!renamingId) return;
+    const trimmed = renameValue.trim();
+    if (trimmed) {
+      setConversations((list) =>
+        list.map((c) => (c.id === renamingId ? { ...c, title: trimmed } : c)),
+      );
+    }
+    setRenamingId(null);
+    setRenameValue("");
+  };
+
+
   if (!active) return null;
   const hasContent = active.messages.length > 0;
 
@@ -749,25 +788,69 @@ export function Home() {
                 </button>
               </div>
               <div className="flex-1 space-y-0.5 overflow-auto">
-                {conversations.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => {
-                      setActiveId(c.id);
-                      setDrawerOpen(false);
-                    }}
-                    className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[12px] transition ${
-                      c.id === activeId
-                        ? "bg-white/[0.05] text-neutral-100"
-                        : "text-neutral-400 hover:bg-white/[0.03] hover:text-neutral-200"
-                    }`}
-                  >
-                    <span className="truncate">{c.title}</span>
-                    {c.status === "analyzing" && (
-                      <Loader2 size={11} className="ml-2 shrink-0 animate-spin text-neutral-500" />
-                    )}
-                  </button>
-                ))}
+              {conversations.map((c) => (
+                <div
+                  key={c.id}
+                  className={`group relative flex items-center rounded transition ${
+                    c.id === activeId
+                      ? "bg-white/[0.05]"
+                      : "hover:bg-white/[0.03]"
+                  }`}
+                >
+                  {renamingId === c.id ? (
+                    // ---- inline rename input ----
+                    <input
+                      id={`rename-input-${c.id}`}
+                      autoFocus
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onBlur={commitRename}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitRename();
+                        if (e.key === "Escape") { setRenamingId(null); setRenameValue(""); }
+                      }}
+                      className="w-full flex-1 rounded bg-white/[0.06] px-2 py-1.5 text-[12px] text-neutral-100 outline-none ring-1 ring-white/10 focus:ring-cyan-500/40"
+                    />
+                  ) : (
+                    // ---- normal row ----
+                    <button
+                      onClick={() => { setActiveId(c.id); setDrawerOpen(false); }}
+                      className={`flex flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] ${
+                        c.id === activeId ? "text-neutral-100" : "text-neutral-400 group-hover:text-neutral-200"
+                      }`}
+                    >
+                      <span className="flex-1 truncate">{c.title}</span>
+                      {c.status === "analyzing" && (
+                        <Loader2 size={11} className="shrink-0 animate-spin text-neutral-500" />
+                      )}
+                    </button>
+                  )}
+
+                  {/* action icons — visible on hover or when active */}
+                  {renamingId !== c.id && (
+                    <div className={`flex items-center gap-0.5 pr-1 opacity-0 transition-opacity group-hover:opacity-100 ${
+                      c.id === activeId ? "opacity-100" : ""
+                    }`}>
+                      <button
+                        id={`rename-btn-${c.id}`}
+                        onClick={(e) => { e.stopPropagation(); startRename(c.id, c.title); }}
+                        title="Rename"
+                        className="rounded p-1 text-neutral-600 hover:bg-white/[0.06] hover:text-neutral-300 transition"
+                      >
+                        <Pencil size={11} strokeWidth={1.5} />
+                      </button>
+                      <button
+                        id={`delete-btn-${c.id}`}
+                        onClick={(e) => { e.stopPropagation(); deleteConversation(c.id); }}
+                        title="Delete conversation"
+                        className="rounded p-1 text-neutral-600 hover:bg-red-500/10 hover:text-red-400 transition"
+                      >
+                        <X size={11} strokeWidth={1.5} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
               </div>
               <div className="mt-2 border-t border-white/[0.06] pt-2">
                 <button
