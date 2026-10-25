@@ -11,6 +11,7 @@ It sees structured findings produced by these functions.
 
 import os
 import re
+import time
 
 from shared.constants import (
     SUSPICIOUS_API_PATTERNS,
@@ -21,19 +22,32 @@ from shared.constants import (
 )
 
 
-def extract_api_calls_from_source(source_dir):
+def extract_api_calls_from_source(source_dir, deadline=None, max_files=None, stats=None):
     """Scan decompiled Java source for suspicious API usage.
     Filters out noisy patterns from standard library paths.
     Tags each finding with is_library and signal_level (HIGH/MEDIUM/LOW).
 
     This is the core static code scanner. It walks every .java file
     produced by JADX and matches against SUSPICIOUS_API_PATTERNS.
+
+    Bounded by `deadline` (a time.monotonic() value) and `max_files` so a large
+    app — which decompiles to 10k+ files and takes minutes to scan in full —
+    cannot stall the caller indefinitely. When either bound is hit the scan
+    stops early and records that fact in `stats` rather than silently returning
+    partial results that look complete.
     """
     found_apis = []
+    if stats is not None:
+        stats.update({"files_scanned": 0, "truncated": False, "truncation_reason": None})
     if not os.path.exists(source_dir):
         return found_apis
     seen = set()
+    scanned = 0
+    truncated_reason = None
+
     for root, _, files in os.walk(source_dir):
+        if truncated_reason:
+            break
         # Determine if this file lives inside a known library path
         rel_path = os.path.relpath(root, source_dir).replace("\\", "/")
         is_library = any(rel_path.startswith(pfx) or f"/{pfx}" in rel_path
@@ -41,6 +55,15 @@ def extract_api_calls_from_source(source_dir):
         for f in files:
             if not f.endswith('.java'):
                 continue
+            if max_files is not None and scanned >= max_files:
+                truncated_reason = f"file cap reached ({max_files} files)"
+                break
+            # Checking the clock every file would dominate the loop; every 250
+            # files bounds overshoot to well under a second.
+            if deadline is not None and scanned % 250 == 0 and time.monotonic() > deadline:
+                truncated_reason = "time budget exhausted"
+                break
+            scanned += 1
             file_path = os.path.join(root, f)
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -62,23 +85,49 @@ def extract_api_calls_from_source(source_dir):
                                 })
             except Exception:
                 pass
+
+    if truncated_reason:
+        print(f"[Evidence] API scan truncated: {truncated_reason} "
+              f"({scanned} files scanned)", flush=True)
+    if stats is not None:
+        stats.update({
+            "files_scanned": scanned,
+            "truncated": bool(truncated_reason),
+            "truncation_reason": truncated_reason,
+        })
     return found_apis
 
 
-def scan_hardcoded_secrets(source_dir):
+def scan_hardcoded_secrets(source_dir, deadline=None, max_files=None):
     """Scan decompiled Java source for hardcoded secrets using regex.
 
     Looks for patterns like hardcoded passwords, API keys, backdoor
     credential checks, and hardcoded IP addresses.
+
+    Bounded by `deadline`/`max_files` for the same reason as
+    extract_api_calls_from_source — this runs the full regex set against every
+    line of every file, so it must not be allowed to run unbounded.
     """
     findings = []
     if not os.path.exists(source_dir):
         return findings
     seen = set()
+    scanned = 0
+    truncated_reason = None
+
     for root, _, files in os.walk(source_dir):
+        if truncated_reason:
+            break
         for fname in files:
             if not fname.endswith('.java'):
                 continue
+            if max_files is not None and scanned >= max_files:
+                truncated_reason = f"file cap reached ({max_files} files)"
+                break
+            if deadline is not None and scanned % 250 == 0 and time.monotonic() > deadline:
+                truncated_reason = "time budget exhausted"
+                break
+            scanned += 1
             fpath = os.path.join(root, fname)
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -97,6 +146,10 @@ def scan_hardcoded_secrets(source_dir):
                                     })
             except Exception:
                 pass
+
+    if truncated_reason:
+        print(f"[Evidence] Secret scan truncated: {truncated_reason} "
+              f"({scanned} files scanned)", flush=True)
     return findings
 
 

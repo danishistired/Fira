@@ -72,7 +72,15 @@ class Planner:
         and journal entry in memory.
         """
         # Build the system prompt with tool descriptors + metadata + RAG context
-        tool_descriptors = tool_registry.list_tools()
+        # run_monkey and run_mobsf are hidden from the Full Analysis planner — UI automation
+        # (run_ui_automation) supersedes them with LLM-guided exploration + concurrent Frida.
+        # They remain in the registry so Dynamic-Only orchestrator can still use them.
+        # Tools disabled mid-investigation (e.g. apktool timed out on a huge APK)
+        # are hidden too — they must not be selected again.
+        PLANNER_HIDDEN_TOOLS = ["run_monkey", "run_mobsf", "ui_automator"]
+        tool_descriptors = tool_registry.list_tools_for_planner(
+            exclude=PLANNER_HIDDEN_TOOLS + list(memory.disabled_tools)
+        )
 
         # Retrieve ATT&CK context from RAG
         rag_context = ""
@@ -91,8 +99,20 @@ class Planner:
 
         # Build the user message with investigation state + budget
         investigation_state = memory.get_planner_summary()
-        available_tools = tool_registry.list_tool_names()
+        available_tools = [t for t in tool_registry.list_tool_names()
+                           if t not in memory.disabled_tools]
         budget = memory.get_budget_status()
+
+        constraints = [
+            f"- apk_path: {memory.apk_path}",
+            f"- package_name: {memory.package_name}",
+            f"- Tools already run: {', '.join(memory.tool_outputs.keys()) if memory.tool_outputs else 'none'}",
+        ]
+        if memory.disabled_tools:
+            constraints.append(
+                "- DISABLED tools (never select these again): " +
+                "; ".join(f"{name} ({reason})" for name, reason in memory.disabled_tools.items())
+            )
 
         user_message = f"""## Current Investigation State
 
@@ -110,20 +130,18 @@ class Planner:
 {json.dumps(available_tools)}
 
 ## Constraints
-- apk_path: {memory.apk_path}
-- package_name: {memory.package_name}
-- Tools already run: {', '.join(memory.tool_outputs.keys()) if memory.tool_outputs else 'none'}
+{chr(10).join(constraints)}
 
 Reflect on the evidence, update your hypotheses, identify knowledge gaps, and decide the next investigation step. Respond with ONLY a JSON object."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
 
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             try:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ]
-
                 if attempt == 1:
                     log_llm_prompt(f"Planner (iteration {memory.iteration})", messages)
 
@@ -144,6 +162,33 @@ Reflect on the evidence, update your hypotheses, identify knowledge gaps, and de
                 print(f"[Planner] Received reasoning ({len(raw)} chars)", flush=True)
 
                 decision = parse_llm_json(raw)
+
+                # Safeguard: never honour a decision that selects a disabled tool.
+                # Re-ask once with an explicit correction; if the model insists,
+                # conclude the investigation instead of executing the tool again.
+                picked = decision.get("next_action", decision.get("action", ""))
+                if picked in memory.disabled_tools:
+                    reason = memory.disabled_tools[picked]
+                    if attempt < max_attempts:
+                        print(f"[Planner] Rejected disabled tool '{picked}' — re-asking (attempt {attempt})", flush=True)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"CORRECTION: '{picked}' is DISABLED for this investigation "
+                                f"({reason}). It must NOT be selected again. "
+                                f"Choose a different tool or generate_report."
+                            ),
+                        })
+                        continue
+                    print(f"[Planner] Model insists on disabled tool '{picked}' — concluding investigation", flush=True)
+                    return {
+                        "action": "generate_report",
+                        "arguments": {"reasoning": f"Planner repeatedly selected disabled tool '{picked}'."},
+                        "reason": (
+                            f"Planner repeatedly selected disabled tool '{picked}' ({reason}). "
+                            f"Generating report with available evidence."
+                        ),
+                    }
 
                 # Store all reasoning in memory BEFORE returning the action
                 self._store_reasoning(decision, memory)
@@ -267,11 +312,12 @@ Reflect on the evidence, update your hypotheses, identify knowledge gaps, and de
         args = decision["arguments"]
         action = decision["action"]
 
-        if action in ("extract_manifest", "run_apktool", "run_jadx", "run_frida", "scan_permissions"):
+        if action in ("extract_manifest", "run_apktool", "run_jadx", "run_frida",
+                       "scan_permissions", "run_ui_automation"):
             if "apk_path" not in args:
                 args["apk_path"] = memory.apk_path
 
-        if action in ("run_frida", "run_monkey", "collect_logcat"):
+        if action in ("run_frida", "run_monkey", "collect_logcat", "run_ui_automation"):
             if "package_name" not in args and memory.package_name != "unknown":
                 args["package_name"] = memory.package_name
 

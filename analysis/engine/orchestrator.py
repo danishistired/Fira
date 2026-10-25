@@ -21,7 +21,7 @@ from engine.memory import InvestigationMemory
 from engine.planner import Planner
 from engine.prompts import build_consensus_system_prompt, MODEL_FAST
 from shared.language import parse_llm_json, enforce_language_on_findings, log_llm_prompt
-from shared.scoring import compute_risk_score
+from shared.scoring import compute_risk_assessment
 from shared.evidence import build_correlation_matrix
 from tools.virustotal_tool import VirusTotalTool
 from tools.malwarebazaar_tool import MalwareBazaarTool
@@ -52,6 +52,7 @@ TOOL_LABELS = {
     "capture_screenshot":     "Capturing runtime screenshot",
     "run_mobsf":              "MobSF independent analysis",
     "capture_network_traffic":"Capturing network traffic",
+    "run_ui_automation":      "LLM-guided UI automation",
     "generate_report":        "Finalising verdict",
 }
 
@@ -67,6 +68,7 @@ TOOL_AGENT_MAP = {
     "capture_screenshot":     "behavior",
     "run_mobsf":              "code",
     "capture_network_traffic":"network",
+    "run_ui_automation":      "behavior",
     "generate_report":        "consensus",
 }
 
@@ -230,6 +232,23 @@ class InvestigationOrchestrator:
             # Emit tool starting
             label = TOOL_LABELS.get(action, action)
             agent = TOOL_AGENT_MAP.get(action, "")
+
+            # Safeguard: never execute a tool that was disabled earlier in
+            # this investigation (e.g. apktool timed out on a huge APK).
+            if action in memory.disabled_tools:
+                print(f"[Orchestrator] Skipping disabled tool '{action}': "
+                      f"{memory.disabled_tools[action]}", flush=True)
+                memory.add_decision(action, f"Skipped — disabled by safeguard: {memory.disabled_tools[action]}",
+                                    "Not executed (disabled)")
+                _emit("tool_done", {
+                    "tool": action,
+                    "label": label,
+                    "agent": agent,
+                    "summary": "Skipped (disabled by safeguard)",
+                    "success": False,
+                })
+                continue
+
             _emit("tool_start", {
                 "tool": action,
                 "label": label,
@@ -350,12 +369,19 @@ class InvestigationOrchestrator:
                 snippet_lines.append(f"\n--- {s['file']} (line {s['line']}, API: {s['api']}) ---")
                 snippet_lines.append(f"```java\n{s['code']}\n```")
 
-        # Risk score
-        risk_score = compute_risk_score(
+        # Risk score — pass the full breakdown (not just the number) so the
+        # consensus LLM can see WHAT is driving the score (e.g. a combo bonus
+        # that fires on any SMS+network co-occurrence) instead of anchoring
+        # on an opaque percentage it can't reason about.
+        risk_assessment = compute_risk_assessment(
             memory.permissions, memory.high_risk_permissions,
             memory.api_calls, memory.manifest_vulnerabilities,
-            memory.hardcoded_secrets, memory.raw_dynamic_logs
+            memory.hardcoded_secrets, memory.raw_dynamic_logs,
+            correlations=memory.correlation_matrix,
+            osint=memory.osint,
+            analysis_scope=("static_and_dynamic" if dynamic_ran else "static_only"),
         )
+        risk_score = risk_assessment["score"]
 
         # Investigation hypotheses (provide to consensus for context)
         hypothesis_lines = []
@@ -375,7 +401,7 @@ class InvestigationOrchestrator:
             "\n".join(snippet_lines) +
             "\n".join(hypothesis_lines) +
             "\n".join(timeline_lines) +
-            f"\n\n**Rule-based risk score**: {risk_score}%"
+            f"\n\n**Rule-based risk score**: {risk_score}% ({risk_assessment['breakdown']})"
             f"\n**Package**: {memory.package_name}"
         )
 
@@ -404,6 +430,10 @@ class InvestigationOrchestrator:
 
                 consensus = parse_llm_json(raw)
                 consensus = enforce_language_on_findings(consensus)
+                if not isinstance(consensus, dict):
+                    print(f"[Orchestrator] Consensus was not a JSON object "
+                          f"({type(consensus).__name__}) — treating as no consensus", flush=True)
+                    return None
                 return consensus
 
             except Exception as e:
@@ -416,17 +446,24 @@ class InvestigationOrchestrator:
         dynamic_ran = memory.coverage.get("runtime_frida", False)
         analysis_scope = "static_and_dynamic" if dynamic_ran else "static_only"
 
-        risk_score = compute_risk_score(
+        risk_score = compute_risk_assessment(
             memory.permissions, memory.high_risk_permissions,
             memory.api_calls, memory.manifest_vulnerabilities,
-            memory.hardcoded_secrets, memory.raw_dynamic_logs
-        )
+            memory.hardcoded_secrets, memory.raw_dynamic_logs,
+            correlations=memory.correlation_matrix,
+            osint=memory.osint,
+            analysis_scope=analysis_scope,
+        )["score"]
 
         # Pipeline status (backward compat)
+        apktool_disabled = memory.disabled_tools.get("run_apktool")
         pipeline_status = {
             "apktool": {
                 "success": memory.coverage.get("apktool_resources", False),
-                "message": "APKTool extraction successful" if memory.coverage.get("apktool_resources") else "Planner decided to skip",
+                "message": (
+                    f"Skipped — {apktool_disabled}" if apktool_disabled else
+                    ("APKTool extraction successful" if memory.coverage.get("apktool_resources") else "Planner decided to skip")
+                ),
             },
             "jadx": {
                 "success": memory.coverage.get("source_code", False),
@@ -453,6 +490,7 @@ class InvestigationOrchestrator:
             "investigation_timeline": memory.decisions,
             "investigation_iterations": memory.iteration,
             "investigation_coverage": memory.get_coverage_report(),
+            "disabled_tools": memory.disabled_tools,
 
             # NEW: Agentic reasoning data (for frontend investigation journal)
             "investigation_journal": memory.journal,
@@ -463,7 +501,7 @@ class InvestigationOrchestrator:
         }
 
         # Add consensus/LLM results if available
-        if consensus:
+        if isinstance(consensus, dict):
             result["verdict"] = consensus.get("verdict")
             result["confidence"] = consensus.get("confidence")
             result["confidence_breakdown"] = consensus.get("confidence_breakdown")
@@ -472,19 +510,31 @@ class InvestigationOrchestrator:
             result["recommended_actions"] = consensus.get("recommended_actions")
             result["mitre_techniques"] = consensus.get("mitre_techniques", [])
 
+            # Shape-tolerant: the consensus LLM sometimes writes prose strings
+            # instead of the expected nested dict/list structure (e.g.
+            # "findings": "no evidence" instead of a list of dicts). Skip any
+            # malformed pieces instead of crashing the whole investigation.
             agent_findings = consensus.get("agent_findings", {})
-            for agent_id in ["perm", "code", "network", "threat", "behavior"]:
-                if agent_id in agent_findings:
+            if isinstance(agent_findings, dict):
+                for agent_id in ["perm", "code", "network", "threat", "behavior"]:
+                    if agent_id not in agent_findings:
+                        continue
                     agent_data = agent_findings[agent_id]
+                    if not isinstance(agent_data, dict):
+                        continue
                     if "summary" not in agent_data:
                         agent_data["summary"] = "Analysis complete"
                     if "detail" not in agent_data and "findings" in agent_data:
+                        findings = agent_data.get("findings")
                         details = []
-                        for f in agent_data.get("findings", [])[:3]:
-                            interp = f.get("interpretation", f.get("evidence", ""))
-                            conf = f.get("confidence", "")
-                            validation = f.get("runtime_validation", "NOT_TESTED")
-                            details.append(f"[{conf}] {interp} (Validation: {validation})")
+                        if isinstance(findings, list):
+                            for f in findings[:3]:
+                                if not isinstance(f, dict):
+                                    continue
+                                interp = f.get("interpretation", f.get("evidence", ""))
+                                conf = f.get("confidence", "")
+                                validation = f.get("runtime_validation", "NOT_TESTED")
+                                details.append(f"[{conf}] {interp} (Validation: {validation})")
                         agent_data["detail"] = " ".join(details) if details else agent_data["summary"]
             result["agent_findings"] = agent_findings
         else:
@@ -514,6 +564,10 @@ class InvestigationOrchestrator:
         ]
 
         for tool_name, args in tools_to_run:
+            # Safeguard: skip tools disabled earlier in this investigation
+            if tool_name in memory.disabled_tools:
+                print(f"[Orchestrator] Fallback: skipping disabled tool '{tool_name}'", flush=True)
+                continue
             memory.iteration += 1
             label = TOOL_LABELS.get(tool_name, tool_name)
             agent = TOOL_AGENT_MAP.get(tool_name, "")

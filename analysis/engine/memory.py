@@ -45,12 +45,14 @@ class InvestigationMemory:
         self.permissions: list[str] = []
         self.high_risk_permissions: list[str] = []
         self.manifest_vulnerabilities: list[dict] = []
+        self.signing_info: dict = {}
         self.api_calls: list[dict] = []
         self.code_snippets: list[dict] = []
         self.hardcoded_secrets: list[dict] = []
         self.runtime_events: list[dict] = []
         self.raw_dynamic_logs: list = []
         self.manifest_xml: str = ""
+        self.resource_strings: list[dict] = []
         self.correlation_matrix: list[dict] = []
 
         # Phase 2: Dynamic analysis evidence buckets
@@ -75,11 +77,19 @@ class InvestigationMemory:
             "apktool_resources": False,
             "runtime_frida": False,
             "runtime_monkey": False,
+            "ui_automation": False,      # Full Analysis mode: LLM-guided UI exploration
             "logcat": False,
             "screenshot": False,
             "mobsf": False,              # Phase 2
             "network_capture": False,    # Phase 2
         }
+
+        # Tools disabled mid-investigation (name -> reason). A tool sets
+        # this via {"disable": True, "disable_reason": ...} in its result
+        # (e.g. apktool timing out on a too-large APK). The planner must
+        # never select a disabled tool again and the orchestrator skips
+        # executing it defensively.
+        self.disabled_tools: dict[str, str] = {}
 
         # Sandbox status (for backward compatibility)
         self.sandbox_status: dict = {"success": False, "message": "Not run"}
@@ -116,6 +126,13 @@ class InvestigationMemory:
         self.tool_outputs[tool_name] = result
         self._tool_call_count += 1
 
+        # Safeguard: a tool can request to be disabled for the rest of the
+        # investigation (e.g. apktool timing out on a too-large APK).
+        if result.get("disable"):
+            reason = result.get("disable_reason") or result.get("error", "unknown reason")
+            self.disabled_tools[tool_name] = reason
+            print(f"[Memory] Tool {tool_name} DISABLED for this investigation: {reason}", flush=True)
+
         if not result.get("success", False):
             print(f"[Memory] Tool {tool_name} failed: {result.get('error', 'unknown')}", flush=True)
             return
@@ -131,6 +148,23 @@ class InvestigationMemory:
             self._ingest_jadx(result)
         elif tool_name == "run_frida":
             self._ingest_frida(result)
+        elif tool_name == "run_ui_automation":
+            # Bridge tool returns the same Frida-shaped result + exploration metadata.
+            # Route through _ingest_frida so runtime_events, hook_coverage, etc. are
+            # all captured and runtime_frida coverage is marked — the verdict engine
+            # then treats this as dynamic analysis ("static_and_dynamic" scope).
+            self._ingest_frida(result)
+            self.coverage["ui_automation"] = True
+            # Store exploration journal in a dedicated attribute if present
+            if result.get("exploration"):
+                self.sandbox_status = {
+                    "success": True,
+                    "message": (
+                        f"UI automation: {result['exploration'].get('total_steps', 0)} steps, "
+                        f"{result['exploration'].get('screens_explored', 0)} screens, "
+                        f"stop={result['exploration'].get('stop_reason', 'unknown')}"
+                    ),
+                }
         elif tool_name == "run_monkey":
             self.coverage["runtime_monkey"] = True
         elif tool_name == "collect_logcat":
@@ -156,11 +190,13 @@ class InvestigationMemory:
     def _ingest_permissions(self, result: dict):
         """Extract deep permission/vulnerability analysis."""
         self.manifest_vulnerabilities = result.get("manifest_vulnerabilities", [])
+        self.signing_info = result.get("signing_info", {})
         self.coverage["permissions_deep"] = True
 
     def _ingest_apktool(self, result: dict):
         """Extract APKTool results."""
         self.manifest_xml = result.get("manifest_xml", "")
+        self.resource_strings = result.get("resource_strings", [])
         self.coverage["apktool_resources"] = True
 
     def _ingest_jadx(self, result: dict):
@@ -345,6 +381,13 @@ class InvestigationMemory:
         sections.append(f"Completed: {', '.join(covered) if covered else 'None'}")
         sections.append(f"Not yet analyzed: {', '.join(not_covered) if not_covered else 'All areas covered'}")
 
+        # 2b. Disabled tools (safeguard — never select these again)
+        if self.disabled_tools:
+            sections.append(f"\n## Disabled Tools (safeguard)")
+            sections.append("These tools failed hard and are DISABLED — do NOT select them again:")
+            for name, reason in self.disabled_tools.items():
+                sections.append(f"- {name}: {reason}")
+
         # 3. Key evidence (structured, not raw)
         sections.append(f"\n## Evidence Summary")
 
@@ -374,6 +417,18 @@ class InvestigationMemory:
             for v in self.manifest_vulnerabilities[:5]:
                 sections.append(f"- [{v.get('severity')}] {v.get('title')}")
 
+        if self.coverage["permissions_deep"] and self.signing_info:
+            si = self.signing_info
+            sections.append(f"\n### Signing Certificate")
+            if si.get("signed"):
+                sections.append(f"- Subject: {si.get('subject', 'unknown')}")
+                sections.append(f"- Self-signed: {si.get('self_signed')}")
+                sections.append(f"- Validity: {si.get('not_valid_before', '?')} to {si.get('not_valid_after', '?')}")
+                if si.get("is_google_play_signing_cert"):
+                    sections.append("- Distribution: signed with Google Play App Signing certificate (Play Store distribution signal)")
+            else:
+                sections.append("- APK is NOT signed (or signature could not be parsed)")
+
         if self.coverage["source_code"]:
             app_apis = [a for a in self.api_calls if not a.get('is_library', False)]
             high = [a for a in app_apis if a.get('signal') == 'HIGH']
@@ -400,8 +455,9 @@ class InvestigationMemory:
             assets = apktool_out.get("embedded_assets", [])
             secondary = apktool_out.get("secondary_dex_files", [])
             suspicious = apktool_out.get("suspicious_resources", [])
+            urls = [r.get("value") for r in self.resource_strings if r.get("type") == "url"]
 
-            if any([smali, native, assets, secondary, suspicious]):
+            if any([smali, native, assets, secondary, suspicious, urls]):
                 sections.append(f"\n### Resource Analysis (APKTool)")
                 if smali.get("total_classes"):
                     sections.append(f"- Smali: {smali['total_classes']} classes, {smali.get('dex_count', 1)} DEX files, multidex={smali.get('is_multidex', False)}")
@@ -413,6 +469,8 @@ class InvestigationMemory:
                     sections.append(f"- Secondary DEX files: {len(secondary)} (potential dropper)")
                 for s in suspicious:
                     sections.append(f"  - [{s.get('severity')}] {s.get('finding')}")
+                if urls:
+                    sections.append(f"- Embedded URLs/domains in resources: {', '.join(urls[:10])}")
 
         if self.coverage["runtime_frida"]:
             sections.append(f"\n### Runtime Analysis")

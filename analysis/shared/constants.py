@@ -17,6 +17,30 @@ import re
 ARGUS_TEMP_DIR = os.path.join("D:\\", "argus-temp")
 os.makedirs(ARGUS_TEMP_DIR, exist_ok=True)
 
+
+# ---------- Tool Safeguards ----------
+# Hard timeout for APKTool disassembly (seconds). Large APKs can make apktool
+# run effectively forever (smali disassembly of huge apps). When this limit is
+# hit the process tree is killed and the tool is disabled for the rest of the
+# investigation instead of being retried by the planner.
+APKTOOL_TIMEOUT_SECONDS = 120
+
+# JADX decompilation budget (seconds). Every phase is bounded so the tool can
+# never hang: the first decompile attempt, the degraded retry, the source scan
+# that runs afterwards, and the total wall-clock across all of them. The total
+# is the hard ceiling — whatever is left after the first attempt is what the
+# retry and scan get to share.
+JADX_TIMEOUT_SECONDS       = 240   # first (full-quality) decompile attempt
+JADX_RETRY_TIMEOUT_SECONDS = 180   # degraded retry (less work, more heap)
+JADX_SCAN_TIMEOUT_SECONDS  = 120   # post-decompile source scanning
+JADX_TOTAL_BUDGET_SECONDS  = 540   # hard ceiling for the whole tool call
+
+# Cap on how many decompiled .java files the source scanners will read. A large
+# app decompiles to 10k+ files; scanning every line of every file with the full
+# regex set costs minutes. Beyond this cap the scan reports itself as truncated
+# rather than running unbounded.
+JADX_SCAN_MAX_FILES = 12000
+
 # ---------- High-Risk Permission Set ----------
 # These permissions represent capabilities that are commonly abused by malware.
 # Used by the manifest tool and scoring engine to flag dangerous permissions.

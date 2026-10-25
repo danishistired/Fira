@@ -958,6 +958,11 @@ export function Home() {
                   🤖 Requires connected emulator · LLM-guided UI exploration
                 </span>
               )}
+              {analysisMode === "full" && (
+                <span className="text-[10px] text-indigo-400/70">
+                  🔬 Static analysis · LLM-guided UI automation when emulator connected
+                </span>
+              )}
             </div>
 
             <div className="flex items-end gap-2 rounded-xl border border-white/[0.08] bg-[#101014] px-3 py-2.5 focus-within:border-white/20">

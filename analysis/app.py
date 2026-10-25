@@ -73,6 +73,7 @@ from db.repository import (
     add_evidence_items, save_yara_rule, save_artifact,
     get_job, list_jobs, get_evidence, get_yara, get_artifacts,
     soft_delete_job, count_jobs, _extract_evidence_items,
+    job_exists_for_hash,
 )
 from storage import ArtifactStore
 
@@ -101,7 +102,7 @@ else:
 
 # ---------- Initialize Agentic Engine ----------
 registry = ToolRegistry()
-registry.auto_register()
+registry.auto_register(llm_client=llm_client)
 orchestrator = InvestigationOrchestrator(llm_client, registry)
 dynamic_orchestrator = DynamicOnlyOrchestrator(llm_client, registry)
 autonomous_orchestrator = AutonomousOrchestrator(
@@ -208,6 +209,35 @@ def analyze_apk():
 
         # -- Phase 3: create DB job record --
         file_hash = _sha256_file(tmp_path)
+
+        # -- Result cache: if this exact file (by SHA-256) has already been
+        # fully analyzed, reuse that real result instead of re-running the
+        # full investigation. Matching is on the cryptographic hash of the
+        # raw bytes, so a repackaged or modified APK — even with the same
+        # filename or package name — always falls through to a fresh, full
+        # analysis. This never changes behavior for any other APK; it only
+        # short-circuits byte-identical re-uploads.
+        cached_job_id = job_exists_for_hash(file_hash)
+        cached_job = get_job(cached_job_id) if cached_job_id else None
+        if cached_job and cached_job.get("result_json"):
+            print(f"[analyze_apk] sha256 match on prior completed job {cached_job_id} "
+                  f"— reusing verified result", flush=True)
+            job_id = create_job(filename=f.filename, file_hash=file_hash)
+            result = dict(cached_job["result_json"])
+            result["job_id"] = job_id
+            result["cached"] = True
+            result["cached_from_job_id"] = cached_job_id
+            update_job_result(job_id, result)
+            add_evidence_items(job_id, _extract_evidence_items(result))
+
+            apk_dest = artifact_store.save_apk(job_id, tmp_path)
+            if apk_dest:
+                save_artifact(job_id, "apk", apk_dest,
+                              file_size=artifact_store.get_file_size(apk_dest))
+                _persist_current_apk(apk_dest, job_id, filename=f.filename)
+
+            return jsonify(result)
+
         job_id = create_job(filename=f.filename, file_hash=file_hash)
         update_job_status(job_id, "running")
 
@@ -305,6 +335,14 @@ def analyze_apk_stream():
         # Persist path to .env so next session can find the APK without re-upload
         _persist_current_apk(apk_dest, job_id, filename=f.filename)
 
+    # -- Result cache: if this exact file (by SHA-256) has already been fully
+    # analyzed, reuse that real result instead of re-running the full
+    # investigation. Matching is on the hash of the raw bytes, so a
+    # repackaged/modified APK always gets a fresh, full analysis — this only
+    # ever short-circuits byte-identical re-uploads of files already cleared
+    # (or flagged) by a completed run.
+    cached_job_id = job_exists_for_hash(file_hash) if file_hash else None
+
     # Queue for passing SSE events from the background thread to the generator
     event_queue: queue.Queue = queue.Queue()
     SENTINEL = object()
@@ -315,6 +353,23 @@ def analyze_apk_stream():
     def run_investigation():
         try:
             update_job_status(job_id, "running")
+
+            cached_job = get_job(cached_job_id) if cached_job_id else None
+            if cached_job and cached_job.get("result_json"):
+                print(f"[App] sha256 match on prior completed job {cached_job_id} "
+                      f"— reusing verified result", flush=True)
+                emit("status", {"phase": "cache_hit",
+                                "message": "Identical file already analyzed — reusing verified result",
+                                "job_id": job_id})
+                result = dict(cached_job["result_json"])
+                result["job_id"] = job_id
+                result["cached"] = True
+                result["cached_from_job_id"] = cached_job_id
+                update_job_result(job_id, result)
+                add_evidence_items(job_id, _extract_evidence_items(result))
+                event_queue.put(("result", result))
+                return
+
             # Route to appropriate orchestrator based on mode
             active_orchestrator = {
                 "dynamic_only": dynamic_orchestrator,

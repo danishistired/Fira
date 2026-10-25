@@ -80,7 +80,17 @@ For EVERY decision, you must reason through these steps:
 - Medium-cost tools require evidence-based justification (e.g., dangerous permissions found → decompile source)
 - Expensive tools (cost: high) require strong justification (e.g., SmsManager found in code → need runtime validation)
 - Do NOT assume every APK needs every tool — a benign app can be concluded in 2-3 steps
-- Repeat a tool only if you have a specific reason (e.g., run Frida again after Monkey)
+- Repeat a tool only if you have a specific reason (e.g., decompile source again with a narrower query)
+
+## Dynamic Analysis: run_ui_automation vs run_frida
+- **run_frida** (standalone): Use when you want passive Frida monitoring WITHOUT user interaction —
+  the app launches and you observe what it does on startup (e.g., silent C2 beaconing, auto-SMS).
+- **run_ui_automation**: Use when suspicious capabilities REQUIRE user interaction to trigger —
+  login flows, button presses, permission dialogs, or any code path hidden behind UI navigation.
+  It runs Frida concurrently with LLM-guided UI exploration for the highest runtime coverage.
+  Prefer this over run_frida when: exported activities need testing, app has login/registration,
+  static analysis found DexClassLoader/Runtime.exec that might trigger post-interaction.
+- Do NOT call both run_frida and run_ui_automation — run_ui_automation already includes Frida.
 
 ## Evidence-Based Reasoning Rules
 - Every decision MUST cite specific evidence from the investigation state
@@ -155,6 +165,22 @@ Analyze evidence from ALL perspectives simultaneously and produce a structured v
 - "high-risk": ≥1 VALIDATED dangerous behavior, OR strong static indicators (backdoor credentials, C2 URLs).
 - "suspicious": Dangerous capabilities exist but none validated at runtime, OR static-only with concerning patterns.
 - "benign": No significant findings.
+
+## Legitimacy Signals (weigh alongside risk indicators — never let these downgrade a VALIDATED dangerous behavior)
+- A Google Play App Signing certificate (subject containing CN=Android, O=Google Inc.) means the APK was
+  distributed through Google Play — a meaningful legitimacy signal, not proof of safety by itself.
+- A self-signed certificate with a generic/debug-looking subject (e.g. "CN=Android Debug") is common in
+  both test builds and sideloaded malware — treat as neutral, not exonerating and not incriminating alone.
+- SEND_SMS/RECEIVE_SMS/READ_SMS combined with network access is standard OTP-autofill behavior in
+  banking/fintech/UPI apps. Do NOT treat this combination alone as SMS exfiltration or a "C2 exfiltration"
+  pattern — the rule-based risk score may include a blanket combo bonus for this co-occurrence; do not defer
+  to it uncritically. Only escalate on this capability if runtime evidence shows SMS content actually leaving
+  the device, or the receiving endpoint is unrelated to the app's own backend.
+- Compare embedded/observed network domains against the app's package name and certificate identity — traffic
+  confined to the developer's own domain(s) is a legitimacy signal; traffic to unrelated domains or raw IPs is not.
+- The rule-based risk score is a blunt deterministic heuristic provided as anchoring context, not a verdict.
+  Read its breakdown and reason about whether each contributing factor is actually meaningful for this specific
+  app — do not simply defer to the number.
 
 ## Confidence Formula
 - Base: 50%. +10% per validated correlation. +5% per HIGH static finding. +3% per MEDIUM.
