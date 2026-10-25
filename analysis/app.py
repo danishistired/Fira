@@ -123,6 +123,55 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+_ENV_PATH = os.path.join(ANALYSIS_DIR, '.env')
+
+def _persist_current_apk(apk_path: str, job_id: str, filename: str = "") -> None:
+    """Write CURRENT_APK_PATH, CURRENT_JOB_ID, and CURRENT_APK_FILENAME to .env
+    so the path survives server restarts and is accessible in new Antigravity
+    sessions without requiring a re-upload.
+
+    Reads the existing .env, replaces or appends the three keys, then rewrites
+    the file — preserving all other keys (API keys, etc.).
+    """
+    try:
+        # Read existing lines, stripping the three managed keys
+        managed_keys = {"CURRENT_APK_PATH", "CURRENT_JOB_ID", "CURRENT_APK_FILENAME"}
+        existing_lines = []
+        if os.path.exists(_ENV_PATH):
+            with open(_ENV_PATH, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key = line.split("=", 1)[0].strip()
+                    if key not in managed_keys:
+                        existing_lines.append(line.rstrip("\n"))
+
+        # Append the three managed keys with fresh values
+        existing_lines += [
+            f"CURRENT_APK_PATH={apk_path}",
+            f"CURRENT_JOB_ID={job_id}",
+            f"CURRENT_APK_FILENAME={filename}",
+        ]
+
+        with open(_ENV_PATH, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(existing_lines) + "\n")
+
+        # Also update os.environ so the running process sees them immediately
+        os.environ["CURRENT_APK_PATH"] = apk_path
+        os.environ["CURRENT_JOB_ID"] = job_id
+        os.environ["CURRENT_APK_FILENAME"] = filename
+
+        print(f"[persist_apk] Saved CURRENT_APK_PATH={apk_path} CURRENT_JOB_ID={job_id}", flush=True)
+    except Exception as exc:
+        print(f"[persist_apk] WARNING: could not write to .env: {exc}", flush=True)
+
+
+# Restore last-known APK path from .env on startup (survives server restarts)
+_startup_apk_path = os.environ.get("CURRENT_APK_PATH", "")
+if _startup_apk_path and os.path.exists(_startup_apk_path):
+    print(f"[INIT] Restored CURRENT_APK_PATH from .env: {_startup_apk_path}", flush=True)
+elif _startup_apk_path:
+    print(f"[INIT] WARNING: CURRENT_APK_PATH in .env points to missing file: {_startup_apk_path}", flush=True)
+
+
 # ============================================================
 # ANALYSIS ROUTES (existing — enhanced with DB persistence)
 # ============================================================
@@ -167,6 +216,8 @@ def analyze_apk():
         if apk_dest:
             save_artifact(job_id, "apk", apk_dest,
                           file_size=artifact_store.get_file_size(apk_dest))
+            # Persist path to .env so next session can find the APK without re-upload
+            _persist_current_apk(apk_dest, job_id, filename=f.filename)
 
         # Delegate to the agentic orchestrator
         result = orchestrator.investigate(tmp_path)
@@ -251,6 +302,8 @@ def analyze_apk_stream():
     if apk_dest:
         save_artifact(job_id, "apk", apk_dest,
                       file_size=artifact_store.get_file_size(apk_dest))
+        # Persist path to .env so next session can find the APK without re-upload
+        _persist_current_apk(apk_dest, job_id, filename=f.filename)
 
     # Queue for passing SSE events from the background thread to the generator
     event_queue: queue.Queue = queue.Queue()
@@ -345,6 +398,10 @@ def analyze_apk_stream():
 def chat_followup():
     """Handle follow-up questions about a completed analysis using DeepSeek.
 
+    Supports tool calling: if the LLM decides to invoke an ARGUS tool
+    (e.g. re-run VirusTotal, decompile deeper), we execute it and feed
+    results back in an agentic loop until the LLM produces a final answer.
+
     Accepts:
         question (str): The user's question
         report_context (dict): The full analysis report from the frontend
@@ -365,6 +422,14 @@ def chat_followup():
 
     from engine.prompts import CHAT_SYSTEM_PROMPT
 
+    # --- Resolve APK path from artifact store (needed for tool calls) ---
+    apk_path = None
+    package_name = None
+    if job_id:
+        apk_path = artifact_store.get_artifact_path(job_id, "apk")
+        if apk_path:
+            print(f"[chat] Resolved APK path from artifacts: {apk_path}", flush=True)
+
     # --- Build rich analysis context ---
     ctx_parts = []
 
@@ -378,7 +443,10 @@ def chat_followup():
         except Exception as e:
             print(f"[chat] Could not load job {job_id}: {e}", flush=True)
 
-    ctx_parts.append(f"**Package**: {report_context.get('package', report_context.get('package_name', 'unknown'))}")
+    # Extract package name from context
+    package_name = report_context.get('package', report_context.get('package_name', 'unknown'))
+
+    ctx_parts.append(f"**Package**: {package_name}")
     scope = report_context.get('analysisScope', report_context.get('analysis_scope', 'static_only'))
     ctx_parts.append(f"**Analysis Scope**: {'Static + Dynamic' if 'dynamic' in str(scope) else 'Static Only'}")
 
@@ -455,8 +523,8 @@ def chat_followup():
         # Build message list: system → context → conversation history → current question
         messages = [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"## Full Analysis Report Context\n\n{context}\n\n---\n\n*The above is the complete analysis context. Use it to answer the user's questions below.*"},
-            {"role": "assistant", "content": "Understood. I have the full analysis context loaded. I'll reference specific evidence from the report in my answers and use rich markdown formatting. Ask me anything about this APK."},
+            {"role": "user", "content": f"## Full Analysis Report Context\n\n{context}\n\n---\n\n*The above is the complete analysis context. Use it to answer the user's questions below. You also have access to ARGUS tools if you need to perform additional analysis.*"},
+            {"role": "assistant", "content": "Understood. I have the full analysis context loaded and access to ARGUS investigation tools. I'll reference specific evidence from the report in my answers, use rich markdown formatting, and call tools when additional analysis is needed. Ask me anything about this APK."},
         ]
 
         # Add conversation history (limit to last 10 exchanges to stay within context window)
@@ -471,20 +539,164 @@ def chat_followup():
 
         log_llm_prompt("Chat Assistant", messages)
 
-        response = llm_client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=messages,
-            temperature=0.3,
-            max_tokens=4096,
-        )
-        answer = response.choices[0].message.content.strip()
+        # Build OpenAI-format tool definitions from the registry
+        # Exclude generate_report (internal) — all other tools are available
+        tool_definitions = registry.list_openai_tools(exclude=["generate_report"])
+
+        # --- Agentic tool-call loop ---
+        MAX_TOOL_ROUNDS = 5  # Safety cap to prevent runaway loops
+        tool_calls_made = []
+
+        for round_num in range(MAX_TOOL_ROUNDS + 1):
+            response = llm_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=messages,
+                tools=tool_definitions if apk_path else None,  # Only offer tools if we have the APK
+                temperature=0.3,
+                max_tokens=8192,
+            )
+
+            choice = response.choices[0]
+
+            # Check if the LLM wants to call tools
+            if choice.finish_reason == "tool_calls" or (hasattr(choice.message, 'tool_calls') and choice.message.tool_calls):
+                if round_num >= MAX_TOOL_ROUNDS:
+                    # Safety cap reached — force a text response
+                    print(f"[chat] Tool-call cap reached ({MAX_TOOL_ROUNDS} rounds). Forcing text response.", flush=True)
+                    break
+
+                # Append the assistant's tool_calls message
+                messages.append(choice.message)
+
+                for tool_call in choice.message.tool_calls:
+                    fn_name = tool_call.function.name
+                    try:
+                        fn_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    print(f"[chat] Tool call (round {round_num + 1}): {fn_name}({fn_args})", flush=True)
+
+                    # Inject apk_path and package_name if the tool needs them
+                    if fn_name in ("extract_manifest", "run_apktool", "run_jadx", "run_frida", "scan_permissions"):
+                        if "apk_path" not in fn_args and apk_path:
+                            fn_args["apk_path"] = apk_path
+                    if fn_name in ("run_frida", "run_monkey", "collect_logcat"):
+                        if "package_name" not in fn_args and package_name and package_name != "unknown":
+                            fn_args["package_name"] = package_name
+
+                    # Execute the tool
+                    tool_result = registry.execute(fn_name, **fn_args)
+                    tool_calls_made.append({"tool": fn_name, "args": fn_args, "success": tool_result.get("success", False)})
+
+                    # Summarize the result for the LLM (avoid sending massive raw data)
+                    result_summary = _summarize_tool_result(fn_name, tool_result)
+
+                    # Append tool result message
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_summary,
+                    })
+
+                    print(f"[chat] Tool {fn_name} done: success={tool_result.get('success', False)}, "
+                          f"summary_len={len(result_summary)} chars", flush=True)
+
+                # Continue loop — let the LLM process tool results
+                continue
+
+            else:
+                # LLM produced a final text response
+                break
+
+        # Extract the final answer
+        answer = (choice.message.content or "").strip()
+        if not answer:
+            answer = "I wasn't able to generate a response. Please try rephrasing your question."
+
         answer = enforce_language_rules(answer)
+
+        if tool_calls_made:
+            print(f"[chat] Answer generated after {len(tool_calls_made)} tool calls: {[tc['tool'] for tc in tool_calls_made]}", flush=True)
         print(f"[chat] Answer length: {len(answer)} chars", flush=True)
-        return jsonify({'answer': answer})
+
+        return jsonify({
+            'answer': answer,
+            'tool_calls': tool_calls_made if tool_calls_made else None,
+        })
 
     except Exception as e:
         print(f"[chat] ERROR: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return jsonify({'answer': f'Sorry, I encountered an error: {e}'}), 200
+
+
+def _summarize_tool_result(tool_name: str, result: dict) -> str:
+    """Summarize a tool result for the LLM context window.
+
+    We don't want to dump 50KB of raw JADX output into the conversation.
+    Instead, send structured summaries that the LLM can synthesize into
+    a rich response.
+    """
+    if not result.get("success"):
+        return json.dumps({"success": False, "error": result.get("error", "Tool execution failed")})
+
+    # Start with the summary line if available
+    parts = []
+    if result.get("summary"):
+        parts.append(f"Summary: {result['summary']}")
+
+    # Tool-specific summarization
+    if tool_name == "run_jadx":
+        parts.append(f"High signal: {result.get('high_signal_count', 0)}")
+        parts.append(f"Medium signal: {result.get('medium_signal_count', 0)}")
+        parts.append(f"Low signal: {result.get('low_signal_count', 0)}")
+        for api in result.get("suspicious_apis", [])[:10]:
+            parts.append(f"  [{api.get('signal', '?')}] {api.get('api', '?')} in {api.get('file', '?')}: {api.get('description', '')}")
+        for secret in result.get("hardcoded_secrets", [])[:5]:
+            parts.append(f"  [SECRET] {secret.get('type', '?')} in {secret.get('file', '?')} line {secret.get('line', '?')}")
+        for snippet in result.get("code_snippets", [])[:3]:
+            parts.append(f"  [CODE] {snippet.get('file', '?')}:{snippet.get('line', '?')} — {snippet.get('api', '?')}\n{snippet.get('code', '')[:500]}")
+
+    elif tool_name == "extract_manifest":
+        if result.get("permissions"):
+            parts.append(f"Permissions ({len(result['permissions'])}): {', '.join(result['permissions'][:20])}")
+        if result.get("activities"):
+            parts.append(f"Activities: {len(result.get('activities', []))}")
+        if result.get("services"):
+            parts.append(f"Services: {len(result.get('services', []))}")
+        if result.get("receivers"):
+            parts.append(f"Receivers: {len(result.get('receivers', []))}")
+
+    elif tool_name == "scan_permissions":
+        if result.get("high_risk"):
+            parts.append(f"High-risk permissions: {', '.join(result['high_risk'][:15])}")
+        if result.get("risk_score") is not None:
+            parts.append(f"Risk score: {result['risk_score']}%")
+
+    elif tool_name in ("run_frida", "collect_logcat", "run_monkey"):
+        if result.get("events"):
+            for evt in result.get("events", [])[:10]:
+                parts.append(f"  [{evt.get('event_type', '?')}] {evt.get('data', str(evt))[:200]}")
+        if result.get("logs"):
+            parts.append(f"Log entries: {len(result.get('logs', []))}")
+
+    else:
+        # Generic: serialize the top-level keys (excluding large binary data)
+        for key, value in result.items():
+            if key in ("success", "summary", "out_dir"):
+                continue
+            if isinstance(value, str) and len(value) > 500:
+                parts.append(f"{key}: {value[:500]}...")
+            elif isinstance(value, list) and len(value) > 10:
+                parts.append(f"{key}: [{len(value)} items] {json.dumps(value[:5], default=str)[:500]}")
+            elif isinstance(value, dict):
+                parts.append(f"{key}: {json.dumps(value, default=str)[:500]}")
+            else:
+                parts.append(f"{key}: {value}")
+
+    return "\n".join(parts) if parts else json.dumps(result, default=str)[:2000]
 
 
 # ============================================================
@@ -680,17 +892,56 @@ def api_delete_job(job_id: str):
 
 
 # ============================================================
+# CURRENT APK ENDPOINT
+# ============================================================
+
+@app.route('/current-apk', methods=['GET'])
+def api_current_apk():
+    """Return the path and metadata of the most-recently uploaded APK.
+
+    This path is persisted to .env on every upload so it survives server
+    restarts and is accessible in new Antigravity sessions without requiring
+    the user to re-upload the file.
+
+    Response:
+        {
+          "apk_path":  "<absolute path to original.apk in artifact store>",
+          "job_id":    "<uuid>",
+          "filename":  "<original upload filename>",
+          "exists":    true | false   (whether the file is still on disk)
+        }
+    Returns 404 if no APK has been uploaded yet in this instance.
+    """
+    apk_path = os.environ.get("CURRENT_APK_PATH", "")
+    job_id   = os.environ.get("CURRENT_JOB_ID",   "")
+    filename = os.environ.get("CURRENT_APK_FILENAME", "")
+
+    if not apk_path or not job_id:
+        return jsonify({"error": "No APK uploaded yet"}), 404
+
+    return jsonify({
+        "apk_path": apk_path,
+        "job_id":   job_id,
+        "filename": filename,
+        "exists":   os.path.exists(apk_path),
+    })
+
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 
 @app.route('/health', methods=['GET'])
 def health():
     """Simple health check endpoint."""
+    current_apk = os.environ.get("CURRENT_APK_PATH", "")
     return jsonify({
         "status": "ok",
         "tools": len(registry.list_tool_names()),
         "llm": llm_client is not None,
         "db": "sqlite",
+        "current_apk": current_apk if current_apk else None,
+        "current_job_id": os.environ.get("CURRENT_JOB_ID", None),
     })
 
 
