@@ -1,0 +1,145 @@
+﻿===========================================================
+  ARGUS Eye Guard -- Deployment Steps
+===========================================================
+See PREREQUISITES.txt before proceeding.
+
+
+-----------------------------------------------------------
+OPTION A -- Run with Python directly (app.py) (recommended)
+-----------------------------------------------------------
+
+Step 1: Install Python dependencies
+  cd analysis
+  python -m venv .venv
+  .venv\Scripts\activate          # Windows
+  # source .venv/bin/activate     # Linux/macOS
+  pip install -r requirements.txt
+
+Step 2: Start MobSF separately (required by the backend)
+  docker run -d -p 8000:8000 -e MOBSF_API_KEY=argus_mobsf_key_12345 opensecurity/mobile-security-framework-mobsf:latest
+
+Step 3: Start the ARGUS backend
+  cd analysis
+  python app.py
+  # API runs on http://localhost:5050
+
+Step 4: Start the frontend (separate terminal, from project root)
+  npm install
+  npm run dev
+  # Frontend runs on http://localhost:5173
+
+
+-----------------------------------------------------------
+OPTION B -- Run with Docker Compose (Needs some work to get it to work)
+-----------------------------------------------------------
+
+Step 1: Build and start all services
+  docker compose up --build
+
+  This starts:
+    - analysis backend  ->  http://localhost:5050
+    - MobSF             ->  http://localhost:8000
+
+Step 2: Start the frontend (separate terminal, from project root)
+  npm install
+  npm run dev
+  # Frontend runs on http://localhost:5173
+
+Step 3: To stop
+  docker compose down
+
+Note: Database and scan artifacts are persisted in a Docker named
+volume (argus_data) and survive container restarts.
+
+
+-----------------------------------------------------------
+ANDROID EMULATOR -- Dynamic Analysis Setup
+-----------------------------------------------------------
+
+After installing Android Studio and creating the Pixel 6 / API 33 AVD
+(see PREREQUISITES.txt):
+
+1. Start the emulator from Android Studio -> Device Manager -> Play button
+   OR via command line:
+     emulator -avd Pixel_6_API_33
+
+2. Confirm ADB connection:
+     adb devices
+   You should see "emulator-5554  device"
+
+3. Enable root access in emulator shell (required for Frida):
+     adb root
+     adb remount
+
+4. The backend will automatically push frida-server to the emulator
+   on the first dynamic analysis job (cached in analysis/.frida-cache/).
+
+5. Upload an APK through the web UI and click Analyze -- the backend
+   streams live results as it runs static + dynamic analysis.
+
+
+-----------------------------------------------------------
+CLOUD DEPLOYMENT (AWS)
+-----------------------------------------------------------
+
+-- Backend on EC2 --
+
+1. Launch an EC2 instance:
+   - Type      : t3.xlarge (or larger)
+   - AMI       : Ubuntu 22.04 LTS
+   - Storage   : 30 GB gp3
+   - Open ports: 22 (SSH), 5050 (backend API), 8000 (MobSF)
+
+2. SSH into the instance and install Docker:
+     sudo apt update && sudo apt install -y docker.io docker-compose-plugin
+     sudo usermod -aG docker ubuntu && newgrp docker
+
+3. Clone the repo and set up .env:
+     git clone <repo-url>
+     cd argus-eye-guard/analysis
+     nano .env    # paste and fill in your API keys
+
+4. Start the services:
+     cd argus-eye-guard
+     docker compose up -d --build
+
+5. Note the public IP of your EC2 instance.
+
+-- Frontend --
+
+Before building, update the API base URL in the frontend config to:
+  http://<EC2-PUBLIC-IP>:5050
+
+Then build and host the frontend (S3 + CloudFront, Vercel, or Netlify):
+  npm install
+  npm run build
+  # deploy the dist/ folder
+
+-- Android Emulator on EC2 (for dynamic analysis) --
+
+  sudo apt install -y qemu-kvm libvirt-daemon-system android-tools-adb
+  # Install Android SDK command-line tools via Android Studio CLI tools
+  avdmanager create avd -n argus_avd -k "system-images;android-33;google_apis;x86_64"
+  emulator -avd argus_avd -no-audio -no-window -gpu swiftshader_indirect &
+  adb wait-for-device
+
+  The backend will connect via ADB as normal.
+
+-- Security Notes --
+
+- Place the backend behind an AWS Application Load Balancer with HTTPS.
+- Restrict EC2 security group to known IPs for ports 5050 and 8000.
+- Store API keys in AWS Secrets Manager and inject as environment variables.
+
+
+-----------------------------------------------------------
+HEALTH CHECK
+-----------------------------------------------------------
+
+Once the backend is running, verify:
+  curl http://localhost:5050/health
+
+Expected response:
+  {"status": "ok", "tools": <n>, "llm": true, "db": "sqlite", ...}
+
+===========================================================
