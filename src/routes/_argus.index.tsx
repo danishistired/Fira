@@ -26,6 +26,8 @@ import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:5050").replace(/\/+$/, "");
+
 export const Route = createFileRoute("/_argus/")({
   head: () => ({ meta: [{ title: "ARGUS" }] }),
   component: Home,
@@ -321,7 +323,7 @@ export function Home() {
     let aborted = false;
 
     try {
-      const response = await fetch("http://localhost:5050/analyze/stream", {
+      const response = await fetch(`${API_BASE_URL}/analyze/stream`, {
         method: "POST",
         body: form,
       });
@@ -645,7 +647,7 @@ export function Home() {
         .filter((m) => m.text !== "__THINKING__")
         .map((m) => ({ role: m.role, content: m.text }));
 
-      const resp = await fetch("http://localhost:5050/chat", {
+      const resp = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

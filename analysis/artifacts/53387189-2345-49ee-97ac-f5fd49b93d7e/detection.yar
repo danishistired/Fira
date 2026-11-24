@@ -1,1 +1,0 @@
-rule argus_test { condition: true }

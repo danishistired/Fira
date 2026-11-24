@@ -1,145 +1,172 @@
-﻿===========================================================
-  ARGUS Eye Guard -- Deployment Steps
-===========================================================
-See PREREQUISITES.txt before proceeding.
+FIRA — DEPLOYMENT GUIDE
+=======================
+
+Fira's core dynamic-analysis dependency is a rooted Android emulator reachable
+through ADB. The backend coordinates LLM-guided UI exploration, Frida
+instrumentation, logcat, screenshots, and network capture. Static analysis also
+uses Androguard (Python dependency), JADX, and Apktool. MobSF is optional
+secondary enrichment and is not required for the main analysis pipeline.
 
 
------------------------------------------------------------
-OPTION A -- Run with Python directly (app.py) (recommended)
------------------------------------------------------------
+LOCAL DOCKER DEPLOYMENT
+-----------------------
 
-Step 1: Install Python dependencies
-  cd analysis
-  python -m venv .venv
-  .venv\Scripts\activate          # Windows
-  # source .venv/bin/activate     # Linux/macOS
-  pip install -r requirements.txt
+Requirements:
+  - Docker Engine / Docker Desktop with Compose v2
+  - Android Studio SDK, including an x86_64 Android Emulator and Platform Tools
+  - A rootable AVD (Google APIs image, not a Google Play image)
+  - DeepSeek API key for LLM-guided exploration
 
-Step 2: Start MobSF separately (required by the backend)
-  docker run -d -p 8000:8000 -e MOBSF_API_KEY=argus_mobsf_key_12345 opensecurity/mobile-security-framework-mobsf:latest
+1. Start a rootable AVD in Android Studio's Device Manager.
+2. In a host terminal, make the host ADB server reachable to the backend
+   container on the Docker host gateway:
 
-Step 3: Start the ARGUS backend
-  cd analysis
-  python app.py
-  # API runs on http://localhost:5050
-
-Step 4: Start the frontend (separate terminal, from project root)
-  npm install
-  npm run dev
-  # Frontend runs on http://localhost:5173
-
-
------------------------------------------------------------
-OPTION B -- Run with Docker Compose (Needs some work to get it to work)
------------------------------------------------------------
-
-Step 1: Build and start all services
-  docker compose up --build
-
-  This starts:
-    - analysis backend  ->  http://localhost:5050
-    - MobSF             ->  http://localhost:8000
-
-Step 2: Start the frontend (separate terminal, from project root)
-  npm install
-  npm run dev
-  # Frontend runs on http://localhost:5173
-
-Step 3: To stop
-  docker compose down
-
-Note: Database and scan artifacts are persisted in a Docker named
-volume (argus_data) and survive container restarts.
-
-
------------------------------------------------------------
-ANDROID EMULATOR -- Dynamic Analysis Setup
------------------------------------------------------------
-
-After installing Android Studio and creating the Pixel 6 / API 33 AVD
-(see PREREQUISITES.txt):
-
-1. Start the emulator from Android Studio -> Device Manager -> Play button
-   OR via command line:
-     emulator -avd Pixel_6_API_33
-
-2. Confirm ADB connection:
+     adb -a start-server
      adb devices
-   You should see "emulator-5554  device"
 
-3. Enable root access in emulator shell (required for Frida):
+   Never expose ADB port 5037 to the public internet. If Docker cannot reach the
+   host ADB server, set ADB_SERVER_HOST to the host gateway address and ensure
+   the host firewall allows port 5037 only from Docker's private bridge.
+3. Configure the key in the shell or an untracked .env file:
+
+     DEEPSEEK_API_KEY=<your-key>
+
+4. Build and start the backend:
+
+     docker compose up --build -d analysis
+     curl http://localhost:5050/health
+
+5. Start the frontend separately. Set VITE_API_BASE_URL at frontend build time
+   if the backend is not at http://localhost:5050:
+
+     npm install
+     npm run dev
+
+Optional MobSF:
+
+  Configure MOBSF_API_KEY and start it only when desired:
+
+    docker compose --profile mobsf up -d
+
+MobSF is not needed to use emulator exploration, Frida, Androguard, JADX, or
+Apktool. Data is kept in the Docker named volume argus_data.
+
+
+DOCKER HUB IMAGE
+----------------
+
+The backend image uses the repository root as its build context. It installs
+the Python requirements (including Androguard), Java and ADB, and downloads
+pinned JADX and Apktool releases during the image build. Local tool downloads,
+APKs, databases, and scan artifacts are intentionally excluded from Git and
+the Docker build context.
+
+Build and publish a Linux/AMD64 image:
+
+  docker login
+  docker buildx build --platform linux/amd64 \
+    -f analysis/Dockerfile \
+    -t <dockerhub-user>/fira-analysis:<version> \
+    --push .
+
+To run that image with Compose, set ANALYSIS_IMAGE to the pushed tag, then use
+docker compose pull analysis and docker compose up -d --no-build analysis.
+
+
+AWS DEPLOYMENT — EMULATOR-FIRST
+-------------------------------
+
+Use one Linux EC2 host for the first deployment: run the Android emulator on
+the host and the backend in Docker. The Docker backend connects to the host's
+ADB server and persists its SQLite database and uploaded APK artifacts in an
+EBS-backed Docker volume. This single-worker setup is intentional; the current
+analysis request runs synchronously while streaming events, and the project
+does not yet have an emulator worker pool or job queue.
+
+1. Select an EC2 instance and Linux AMI where hardware virtualization/KVM is
+   actually available to the guest. Verify /dev/kvm exists and
+   `emulator -accel-check` succeeds before proceeding. A standard virtualized
+   instance may not expose KVM; use a supported bare-metal/KVM-capable instance
+   or a separate emulator host if it does not. Emulator software rendering can
+   be very slow.
+2. Install Docker Compose, Android command-line tools, Android SDK Platform
+   Tools, and the Android Emulator. Install an x86_64 Google APIs system image
+   (not Google Play), create an AVD, and enable KVM access for the service user.
+   Example SDK components:
+
+     sdkmanager "platform-tools" "emulator" "platforms;android-33" \
+       "system-images;android-33;google_apis;x86_64"
+     avdmanager create avd -n fira-api33 \
+       -k "system-images;android-33;google_apis;x86_64"
+     emulator -accel-check
+
+3. Start the ADB server so the Docker bridge can reach it, then start the AVD
+   and confirm the emulator is online and rooted:
+
+     adb -a start-server
+     emulator -avd fira-api33 -no-window -no-audio \
+       -gpu swiftshader_indirect -no-snapshot &
+     adb wait-for-device
      adb root
-     adb remount
+     adb devices
 
-4. The backend will automatically push frida-server to the emulator
-   on the first dynamic analysis job (cached in analysis/.frida-cache/).
+   Restrict host firewall access to ADB port 5037 to the Docker bridge. Never
+   add port 5037 to an EC2 security group or expose it publicly.
 
-5. Upload an APK through the web UI and click Analyze -- the backend
-   streams live results as it runs static + dynamic analysis.
+4. Configure runtime secrets through AWS Secrets Manager/SSM or a protected
+   environment file outside the repository:
 
+     DEEPSEEK_API_KEY=<your-key>
+     VIRUSTOTAL_API_KEY=<optional-key>
+     MOBSF_API_KEY=<optional-key>
 
------------------------------------------------------------
-CLOUD DEPLOYMENT (AWS)
------------------------------------------------------------
+5. Set ANALYSIS_IMAGE to the Docker Hub tag, BACKEND_BIND=0.0.0.0, and start
+   the backend:
 
--- Backend on EC2 --
+     docker compose pull analysis
+     docker compose up -d --no-build analysis
+     docker compose logs -f analysis
+     curl http://127.0.0.1:5050/health
 
-1. Launch an EC2 instance:
-   - Type      : t3.xlarge (or larger)
-   - AMI       : Ubuntu 22.04 LTS
-   - Storage   : 30 GB gp3
-   - Open ports: 22 (SSH), 5050 (backend API), 8000 (MobSF)
+   Attach an EBS-backed persistent volume to Docker's argus_data volume or
+   configure a bind mount on durable EBS storage. Keep the database and
+   artifacts on the same host/filesystem; SQLite is for this single-instance
+   deployment.
 
-2. SSH into the instance and install Docker:
-     sudo apt update && sudo apt install -y docker.io docker-compose-plugin
-     sudo usermod -aG docker ubuntu && newgrp docker
+6. Put an HTTPS reverse proxy or Application Load Balancer in front of the
+   backend. Set VITE_API_BASE_URL to its HTTPS URL when building the frontend.
+   Allow only the reverse proxy and administrator/VPN addresses in the EC2
+   security group. Do not expose ports 5050, 5037, 8080, or 8000 directly to
+   the internet.
 
-3. Clone the repo and set up .env:
-     git clone <repo-url>
-     cd argus-eye-guard/analysis
-     nano .env    # paste and fill in your API keys
+IMPORTANT ACCESS LIMITATION
 
-4. Start the services:
-     cd argus-eye-guard
-     docker compose up -d --build
+The application currently has no user authentication or authorization. Keep
+the UI and backend private (for example, behind a VPN or strict IP allow-list)
+until authentication is implemented. Do not treat a public frontend or CORS as
+an access-control mechanism.
 
-5. Note the public IP of your EC2 instance.
+MobSF remains optional. To run it on the same host:
 
--- Frontend --
-
-Before building, update the API base URL in the frontend config to:
-  http://<EC2-PUBLIC-IP>:5050
-
-Then build and host the frontend (S3 + CloudFront, Vercel, or Netlify):
-  npm install
-  npm run build
-  # deploy the dist/ folder
-
--- Android Emulator on EC2 (for dynamic analysis) --
-
-  sudo apt install -y qemu-kvm libvirt-daemon-system android-tools-adb
-  # Install Android SDK command-line tools via Android Studio CLI tools
-  avdmanager create avd -n argus_avd -k "system-images;android-33;google_apis;x86_64"
-  emulator -avd argus_avd -no-audio -no-window -gpu swiftshader_indirect &
-  adb wait-for-device
-
-  The backend will connect via ADB as normal.
-
--- Security Notes --
-
-- Place the backend behind an AWS Application Load Balancer with HTTPS.
-- Restrict EC2 security group to known IPs for ports 5050 and 8000.
-- Store API keys in AWS Secrets Manager and inject as environment variables.
+  docker compose --profile mobsf up -d
 
 
------------------------------------------------------------
+FRONTEND BUILD
+--------------
+
+The browser uses VITE_API_BASE_URL for both APK uploads and chat requests. Set
+it at build time; it is public configuration, not a secret:
+
+  VITE_API_BASE_URL=https://<private-api-host> npm run build
+
+Host the generated dist/ directory over HTTPS. Keep API keys only on the
+backend host.
+
+
 HEALTH CHECK
------------------------------------------------------------
+------------
 
-Once the backend is running, verify:
   curl http://localhost:5050/health
 
-Expected response:
-  {"status": "ok", "tools": <n>, "llm": true, "db": "sqlite", ...}
-
-===========================================================
+The response reports backend status, registered tools, LLM configuration,
+database type, and current analysis metadata.

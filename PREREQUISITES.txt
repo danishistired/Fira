@@ -1,70 +1,51 @@
-﻿===========================================================
-  ARGUS Eye Guard -- Prerequisites & System Requirements
-===========================================================
+FIRA — PREREQUISITES
+====================
 
------------------------------------------------------------
-SYSTEM REQUIREMENTS
------------------------------------------------------------
-- OS            : Windows 10/11 (64-bit) or Ubuntu 22.04+
-- RAM           : 16 GB minimum (32 GB recommended for emulator + analysis)
-- Disk          : 20 GB free space
-- Python        : 3.12
-- Node.js       : 18+ (for the frontend)
-- Java          : JDK 11+ (required by JADX and APKTool)
-- Docker        : Docker Desktop 4.x (if using Docker deployment)
-- ADB           : Android Debug Bridge (part of Android SDK Platform Tools)
+CORE REQUIREMENTS
+----------------
 
+- Docker Engine with Docker Compose v2 (for the backend container)
+- Android SDK Platform Tools (ADB)
+- Android Emulator with an x86_64 Google APIs system image
+- A rootable AVD; Google Play emulator images generally do not support adb root
+- Hardware acceleration/KVM for practical emulator performance
+- DeepSeek API key for LLM-guided exploration
 
------------------------------------------------------------
-PREREQUISITES -- SOFTWARE TO INSTALL
------------------------------------------------------------
-
-1. Python 3.12
-   https://www.python.org/downloads/
-
-2. Node.js 18+
-   https://nodejs.org/
-
-3. JDK 11+
-   https://adoptium.net/
-
-4. Docker Desktop
-   https://www.docker.com/products/docker-desktop/
-
-5. Android Studio (for emulator / dynamic analysis)
-   https://developer.android.com/studio
-
-   Inside Android Studio:
-   - Open SDK Manager -> SDK Platforms
-   - Install: Android 13.0 (API Level 33)
-   - Open SDK Manager -> SDK Tools
-   - Install: Android Emulator, Android SDK Platform-Tools, Intel HAXM
-
-   Create a Virtual Device (AVD):
-   - Device   : Pixel 6
-   - System   : API 33 (Android 13, x86_64)
-   - RAM      : 4096 MB
-   - Enable   : Cold Boot
-
-   Start the emulator and confirm ADB sees it:
-     adb devices
-
-6. Frida server -- auto-downloaded by the app on first dynamic analysis run.
-
-7. JADX and APKTool are bundled under tools/ -- no separate install needed.
-
-8. MobSF -- pulled automatically via Docker (see DEPLOYMENT.txt).
+The backend image installs the Python dependencies, including Androguard,
+OpenJDK 17, ADB, JADX, and Apktool. JADX and Apktool are fetched as pinned
+releases during the image build; they do not need to be committed as binaries.
+For local non-Docker backend development, install Python 3.12 and Java 17+,
+then run download_tools.ps1 to fetch the local analyzer tools.
 
 
------------------------------------------------------------
-REQUIRED API KEYS -- create analysis/.env
------------------------------------------------------------
+ANDROID EMULATOR
+----------------
 
-Create the file analysis/.env and fill in your keys:
+In Android Studio's SDK Manager, install:
 
-  DEEPSEEK_API_KEY=<your_deepseek_key>
-  VIRUSTOTAL_API_KEY=<your_virustotal_key>
-  MOBSF_URL=http://localhost:8000
-  MOBSF_API_KEY=argus_mobsf_key_12345
+- Android SDK Platform Tools
+- Android Emulator
+- Android 13 / API 33 platform
+- Android 13 / API 33 Google APIs x86_64 system image
 
-===========================================================
+Create an AVD with the Google APIs image (not Google Play). Start it and verify:
+
+  adb -a start-server
+  adb devices
+  adb root
+
+The Docker backend needs access to the host ADB server on TCP port 5037. Allow
+that port only from the local Docker bridge; never expose it publicly. For AWS,
+use an EC2 host where /dev/kvm is available and `emulator -accel-check`
+succeeds. The emulator runs on the host, not inside the analysis container.
+
+
+OPTIONAL SERVICES AND KEYS
+--------------------------
+
+- VIRUSTOTAL_API_KEY — optional reputation lookup
+- MobSF — optional secondary static analysis, enabled with the Compose `mobsf`
+  profile. Configure MOBSF_API_KEY if it is used.
+
+Do not commit .env files, API keys, APK uploads, databases, or analysis
+artifacts. See DEPLOYMENT.txt for local Compose, Docker Hub, and AWS steps.

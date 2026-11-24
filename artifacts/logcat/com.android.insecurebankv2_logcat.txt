@@ -1,7 +1,0 @@
---------- beginning of main
-06-11 22:39:11.363 W/DynamiteModule( 8200): Local module descriptor class for com.google.android.gms.providerinstaller.dynamite not found.
-06-11 22:39:11.364 W/ProviderHelper( 6694): Unknown dynamite feature providerinstaller.dynamite
-06-11 22:39:11.365 W/ProviderInstaller( 8200): Failed to load providerinstaller module: No acceptable module com.google.android.gms.providerinstaller.dynamite found. Local version is 0 and remote version is 0.
-06-11 22:39:11.660 D/EGL_emulation( 8278): app_time_stats: avg=505.66ms min=499.16ms max=518.06ms count=3
-06-11 22:39:11.876 I/wpa_supplicant(  971): wlan0: CTRL-EVENT-BEACON-LOSS 
-06-11 22:39:12.660 D/EGL_emulation( 8278): app_time_stats: avg=499.97ms min=499.46ms max=500.48ms count=2

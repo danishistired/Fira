@@ -16,6 +16,8 @@ dist-ssr
 .tanstack/**
 .nitro
 *.local
+/.env
+/.env.*
 
 # Wrangler / Cloudflare
 .wrangler/
@@ -42,9 +44,19 @@ analysis/flask.log
 analysis/test_flask.log
 analysis/.frida-cache
 analysis/rag/chroma_data
+*.db
+*.db-shm
+*.db-wal
+analysis/artifacts/
+analysis/out.json
+artifacts/
+prompts_log.txt
+*.apk
+test apps/
+TXT FILES/
 
-# Tools (downloaded separately)
-tools/
+# Downloaded third-party tool bundles at the repository root
+/tools/
 
 # LLM prompt logs (debug output, not for VCS)
 in/prompts_log.txt
@@ -52,6 +64,4 @@ in/*.txt
 
 # to-do
 to-do.md
-
-#lmao testing if my git still works
     

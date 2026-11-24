@@ -10,11 +10,13 @@ No logic lives here — just data definitions.
 
 import os
 import re
+import tempfile
 
 # ---------- Temp / Cache Directory ----------
-# Route all temporary files to D: drive to avoid filling the C: system drive.
-# Falls back to the system default if D:\argus-temp doesn't exist / can't be created.
-ARGUS_TEMP_DIR = os.path.join("D:\\", "argus-temp")
+ARGUS_TEMP_DIR = os.environ.get(
+    "ARGUS_TEMP_DIR",
+    os.path.join(tempfile.gettempdir(), "argus-temp"),
+)
 os.makedirs(ARGUS_TEMP_DIR, exist_ok=True)
 
 

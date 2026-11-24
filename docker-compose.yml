@@ -1,25 +1,48 @@
 services:
   analysis:
-    build: ./analysis
+    image: ${ANALYSIS_IMAGE:-fira-analysis:local}
+    build:
+      context: .
+      dockerfile: analysis/Dockerfile
+    restart: unless-stopped
     ports:
-      - "5050:5050"
+      - "${BACKEND_BIND:-127.0.0.1}:5050:5050"
+      - "127.0.0.1:8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      # DB and artifacts live on a named volume — proper Linux fs, WAL works fine
-      - ARGUS_DB_PATH=/data/argus.db
-      - ARGUS_ARTIFACTS_DIR=/data/artifacts
+      ARGUS_DB_PATH: /data/argus.db
+      ARGUS_ARTIFACTS_DIR: /data/artifacts
+      ARGUS_TEMP_DIR: /tmp/argus-temp
+      ARGUS_MITM_LISTEN_HOST: 0.0.0.0
+      ADB_SERVER_SOCKET: tcp:${ADB_SERVER_HOST:-host.docker.internal}:${ADB_SERVER_PORT:-5037}
+      ANDROID_ADB_SERVER_HOST: ${ADB_SERVER_HOST:-host.docker.internal}
+      ANDROID_ADB_SERVER_PORT: ${ADB_SERVER_PORT:-5037}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      MOBSF_URL: ${MOBSF_URL:-http://mobsf:8000}
+      MOBSF_API_KEY: ${MOBSF_API_KEY:-}
     volumes:
-      # Named volume for persistent data (DB + scan artifacts).
-      # Named volumes use Docker's own ext4 storage → SQLite WAL is fully supported.
       - argus_data:/data
-    depends_on:
-      - mobsf
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   mobsf:
+    profiles: ["mobsf"]
     image: opensecurity/mobile-security-framework-mobsf:latest
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - MOBSF_API_KEY=argus_mobsf_key_12345
+      MOBSF_API_KEY: ${MOBSF_API_KEY:-}
 
 volumes:
   argus_data:
