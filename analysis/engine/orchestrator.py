@@ -327,9 +327,9 @@ class InvestigationOrchestrator:
     def _get_tool_cost(self, tool_name: str) -> str:
         """Look up a tool's cost from its metadata."""
         try:
-            tool = self.tools.get(tool_name)
-            return tool.metadata.get("estimated_cost", "low")
-        except KeyError:
+            metadata = self.tools.get_metadata(tool_name)
+            return metadata.get("estimated_cost", metadata.get("cost", "low"))
+        except (KeyError, AttributeError):
             return "low"
 
     def _generate_consensus(self, memory: InvestigationMemory) -> dict:

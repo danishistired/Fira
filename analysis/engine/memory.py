@@ -196,7 +196,14 @@ class InvestigationMemory:
     def _ingest_apktool(self, result: dict):
         """Extract APKTool results."""
         self.manifest_xml = result.get("manifest_xml", "")
-        self.resource_strings = result.get("resource_strings", [])
+        raw_resources = result.get("resource_entries", result.get("resource_strings", []))
+        self.resource_strings = [
+            item if isinstance(item, dict) else {
+                "type": "url" if str(item).lower().startswith(("http://", "https://")) else "string",
+                "value": str(item),
+            }
+            for item in raw_resources
+        ]
         self.coverage["apktool_resources"] = True
 
     def _ingest_jadx(self, result: dict):

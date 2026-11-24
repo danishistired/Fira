@@ -168,7 +168,10 @@ class AutonomousOrchestrator:
         # ---- Step 4: Run Autonomous Explorer (main thread) ----
         print("[Autonomous] Step 4: Starting autonomous UI explorer...", flush=True)
 
-        ui_tool = self.tools.get("ui_automator")
+        ui_tool = self.tools.get("run_ui_automation")
+        if ui_tool is None:
+            from tools.ui_tool import UIAutomatorTool
+            ui_tool = UIAutomatorTool(self.llm_client)
         config = ExplorationConfig(
             max_steps=50,
             max_seconds=EXPLORATION_WINDOW,
